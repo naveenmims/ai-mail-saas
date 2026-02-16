@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: ai_mail_postgres
+    environment:
+      POSTGRES_DB: ai_mail
+      POSTGRES_USER: ai_mail
+      POSTGRES_PASSWORD: ai_mail_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    container_name: ai_mail_redis
+    ports:
+      - "6379:6379"
+
+volumes:
+  pgdata:
+services:
+  postgres:
+    image: postgres:16
+    container_name: ai_mail_postgres
+    environment:
+      POSTGRES_DB: ai_mail
+      POSTGRES_USER: ai_mail
+      POSTGRES_PASSWORD: ai_mail_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    container_name: ai_mail_redis
+    ports:
+      - "6379:6379"
+
+volumes:
+  pgdata:
