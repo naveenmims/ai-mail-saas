@@ -1,0 +1,236 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AI Mail SaaS Admin</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 1100px; margin: 20px auto; padding: 0 16px; }
+    .row { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 14px; margin-top: 14px; }
+    label { font-size: 12px; color: #444; display:block; margin-bottom: 4px;}
+    input, textarea, select { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 8px; }
+    textarea { min-height: 120px; font-family: ui-monospace, Menlo, Consolas, monospace; }
+    button { padding: 10px 14px; border-radius: 10px; border: 0; cursor: pointer; }
+    .btn { background: #111; color: #fff; }
+    .btn2 { background: #eee; }
+    .small { font-size: 12px; color: #666; }
+    .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .grid1 { display:grid; grid-template-columns: 1fr; gap: 12px; }
+    .ok { color: #0a7b2f; }
+    .err { color: #b00020; white-space: pre-wrap; }
+    .muted { color:#666; }
+  </style>
+</head>
+<body>
+  <h2>AI Mail SaaS — Admin</h2>
+  <p class="small muted">Edit tenant settings (support name/email, website, KB, system prompt, auto-reply, rate limits).</p>
+
+  <div class="card">
+    <div class="row">
+      <div style="flex:1; min-width:260px;">
+        <label>Admin Token</label>
+        <input id="token" placeholder="Paste ADMIN_TOKEN here" />
+      </div>
+      <div style="width:200px;">
+        <label>&nbsp;</label>
+        <button class="btn" onclick="loadOrgs()">Load Organizations</button>
+      </div>
+      <div style="width:160px;">
+        <label>&nbsp;</label>
+        <button class="btn2" onclick="clearForm()">Clear</button>
+      </div>
+    </div>
+
+    <div style="margin-top:12px;">
+      <label>Organizations</label>
+      <select id="orgSelect" onchange="loadOrgDetails()">
+        <option value="">-- Load first --</option>
+      </select>
+    </div>
+
+    <div id="status" class="small" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">Organization Settings</h3>
+
+    <div class="grid2">
+      <div>
+        <label>Name</label>
+        <input id="name" />
+      </div>
+
+      <div>
+        <label>Website</label>
+        <input id="website" placeholder="https://example.com" />
+      </div>
+
+      <div>
+        <label>Support Name</label>
+        <input id="support_name" />
+      </div>
+
+      <div>
+        <label>Support Email</label>
+        <input id="support_email" />
+      </div>
+
+      <div>
+        <label>Auto Reply</label>
+        <select id="auto_reply">
+          <option value="1">Enabled</option>
+          <option value="0">Disabled</option>
+        </select>
+      </div>
+
+      <div>
+        <label>Max Replies / Hour</label>
+        <input id="max_replies_per_hour" type="number" min="0" step="1" />
+      </div>
+    </div>
+
+    <div class="grid1" style="margin-top:12px;">
+      <div>
+        <label>Knowledge Base (kb_text)</label>
+        <textarea id="kb_text" placeholder="Paste tenant info, FAQs, pricing, address, outlet list, etc."></textarea>
+      </div>
+
+      <div>
+        <label>System Prompt (system_prompt)</label>
+        <textarea id="system_prompt" placeholder="Instructions to model (tone, do/don'ts, signature rules, escalation)."></textarea>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:12px;">
+      <button class="btn" onclick="saveOrg()">Save Changes</button>
+      <span class="small muted">Saves only current org selection.</span>
+    </div>
+  </div>
+
+<script>
+const apiBase = ""; // same host
+
+function setStatus(msg, ok=true) {
+  const el = document.getElementById("status");
+  el.className = "small " + (ok ? "ok" : "err");
+  el.textContent = msg;
+}
+
+function getToken() {
+  return document.getElementById("token").value.trim();
+}
+
+async function loadOrgs() {
+  const token = getToken();
+  if (!token) return setStatus("Enter Admin Token first.", false);
+
+  try {
+    const res = await fetch(apiBase + "/admin/orgs", {
+      headers: { "X-Admin-Token": token }
+    });
+    if (!res.ok) {
+      const t = await res.text();
+      return setStatus("Load orgs failed:\n" + t, false);
+    }
+    const data = await res.json();
+
+    const sel = document.getElementById("orgSelect");
+    sel.innerHTML = '<option value="">-- Select --</option>';
+    for (const o of data) {
+      const opt = document.createElement("option");
+      opt.value = o.id;
+      opt.textContent = `${o.id} — ${o.name}`;
+      sel.appendChild(opt);
+    }
+    setStatus("Organizations loaded. Select one to edit.");
+  } catch (e) {
+    setStatus("Load orgs error: " + e, false);
+  }
+}
+
+async function loadOrgDetails() {
+  const token = getToken();
+  const orgId = document.getElementById("orgSelect").value;
+  if (!orgId) return;
+
+  try {
+    const res = await fetch(apiBase + "/admin/orgs/" + orgId, {
+      headers: { "X-Admin-Token": token }
+    });
+    if (!res.ok) {
+      const t = await res.text();
+      return setStatus("Load org details failed:\n" + t, false);
+    }
+    const o = await res.json();
+
+    document.getElementById("name").value = o.name ?? "";
+    document.getElementById("website").value = o.website ?? "";
+    document.getElementById("support_name").value = o.support_name ?? "";
+    document.getElementById("support_email").value = o.support_email ?? "";
+    document.getElementById("kb_text").value = o.kb_text ?? "";
+    document.getElementById("system_prompt").value = o.system_prompt ?? "";
+    document.getElementById("auto_reply").value = String(o.auto_reply ?? 1);
+    document.getElementById("max_replies_per_hour").value = String(o.max_replies_per_hour ?? 10);
+
+    setStatus("Loaded org #" + orgId + " settings.");
+  } catch (e) {
+    setStatus("Load org details error: " + e, false);
+  }
+}
+
+async function saveOrg() {
+  const token = getToken();
+  const orgId = document.getElementById("orgSelect").value;
+  if (!token) return setStatus("Enter Admin Token first.", false);
+  if (!orgId) return setStatus("Select an organization first.", false);
+
+  const payload = {
+    name: document.getElementById("name").value.trim(),
+    website: document.getElementById("website").value.trim(),
+    support_name: document.getElementById("support_name").value.trim(),
+    support_email: document.getElementById("support_email").value.trim(),
+    kb_text: document.getElementById("kb_text").value,
+    system_prompt: document.getElementById("system_prompt").value,
+    auto_reply: parseInt(document.getElementById("auto_reply").value, 10),
+    max_replies_per_hour: parseInt(document.getElementById("max_replies_per_hour").value, 10),
+  };
+
+  try {
+    const res = await fetch(apiBase + "/admin/orgs/" + orgId, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Admin-Token": token
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!res.ok) {
+      const t = await res.text();
+      return setStatus("Save failed:\n" + t, false);
+    }
+
+    const out = await res.json();
+    setStatus("Saved ✅ org_id=" + out.updated_org_id);
+
+    // refresh org list label in dropdown
+    await loadOrgs();
+    document.getElementById("orgSelect").value = orgId;
+  } catch (e) {
+    setStatus("Save error: " + e, false);
+  }
+}
+
+function clearForm() {
+  document.getElementById("orgSelect").value = "";
+  for (const id of ["name","website","support_name","support_email","kb_text","system_prompt","max_replies_per_hour"]) {
+    document.getElementById(id).value = "";
+  }
+  document.getElementById("auto_reply").value = "1";
+  setStatus("Cleared.");
+}
+</script>
+
+</body>
+</html>

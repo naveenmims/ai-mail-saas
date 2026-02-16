@@ -1,0 +1,671 @@
+﻿import os
+import re
+import time
+import sqlite3
+import imaplib
+import smtplib
+from datetime import datetime
+from email import message_from_bytes
+from email.policy import default
+from email.message import EmailMessage
+
+from dotenv import load_dotenv
+from openai import OpenAI
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+
+from app.db import engine
+from app.models import EmailAccount
+
+
+INBOX_FOLDER = "INBOX"
+SCAN_LAST_N = 30  # scan last N emails for a non-marketing one (reduce load)
+
+IGNORE_KEYWORDS = [
+    "unsubscribe", "nurture", "campaign", "offer", "promotion", "newsletter",
+    "webinar", "join us", "register", "event", "summit",
+    "account activity", "new sign-in", "signin", "sign-in", "security alert",
+    "verification", "otp", "password", "login", "suspicious", "alert",
+    "invoice", "commission", "statement", "payment", "receipt", "gst",
+    "do not reply", "no reply", "noreply", "donotreply",
+]
+
+IGNORE_SENDERS = [
+    "no-reply", "noreply", "donotreply", "mailer-daemon", "postmaster",
+    "bounce@", "secureserver.net", "go.", "marketing@", "news@", "updates@"
+]
+
+
+# ---------- helpers ----------
+def safe_decode(b) -> str:
+    try:
+        return b.decode(errors="ignore")
+    except Exception:
+        return ""
+
+
+def extract_email(from_header: str) -> str:
+    """
+    Returns the email part from a From header.
+    Example: 'Name <a@b.com>' -> 'a@b.com'
+    """
+    if not from_header:
+        return ""
+    m = re.search(r"<([^>]+)>", from_header)
+    if m:
+        return m.group(1).strip()
+    return from_header.strip().strip('"')
+
+
+def is_ignored_email(header_text_lower: str) -> bool:
+    if not header_text_lower:
+        return False
+    if any(k in header_text_lower for k in IGNORE_KEYWORDS):
+        return True
+    if any(s in header_text_lower for s in IGNORE_SENDERS):
+        return True
+    return False
+
+
+def get_body_text(msg) -> str:
+    """
+    Prefer plain text. Avoid attachments.
+    """
+    try:
+        body_part = msg.get_body(preferencelist=("plain",))
+        if body_part:
+            return body_part.get_content() or ""
+    except Exception:
+        pass
+
+    try:
+        if msg.is_multipart():
+            for part in msg.walk():
+                ctype = part.get_content_type()
+                disp = str(part.get("Content-Disposition") or "").lower()
+                if "attachment" in disp:
+                    continue
+                if ctype == "text/plain":
+                    return part.get_content() or ""
+        else:
+            return msg.get_content() or ""
+    except Exception:
+        pass
+
+    return ""
+
+
+def db_path_local() -> str:
+    return os.path.join(os.path.dirname(__file__), "ai_mail.db")
+
+
+def sqlite_table_columns(db_path: str, table: str) -> set:
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = {r[1] for r in cur.fetchall()}
+    con.close()
+    return cols
+
+
+def flexible_insert_sqlite(db_path: str, table: str, data: dict):
+    """
+    Insert only into columns that actually exist in the sqlite table.
+    Prevents crashes if your table schema differs.
+    """
+    cols = sqlite_table_columns(db_path, table)
+    payload = {k: v for k, v in data.items() if k in cols}
+    if not payload:
+        return
+
+    keys = list(payload.keys())
+    vals = [payload[k] for k in keys]
+    qmarks = ",".join(["?"] * len(keys))
+    sql = f"INSERT INTO {table} ({','.join(keys)}) VALUES ({qmarks})"
+
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+    cur.execute(sql, vals)
+    con.commit()
+    con.close()
+
+
+def get_org_settings(org_id: int) -> dict:
+    """
+    Load org settings from organizations table (sqlite).
+    """
+    db_path = db_path_local()
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT
+            name, support_name, support_email, website, kb_text, system_prompt,
+            auto_reply, max_replies_per_hour
+        FROM organizations
+        WHERE id=?
+        """,
+        (org_id,),
+    )
+    row = cur.fetchone()
+    con.close()
+
+    if not row:
+        return {
+            "org_name": f"Org{org_id}",
+            "support_name": f"Tenant{org_id} Support",
+            "support_email": "",
+            "website": "",
+            "kb_text": "",
+            "system_prompt": "",
+            "auto_reply": 1,
+            "max_replies_per_hour": 10,
+        }
+
+    return {
+        "org_name": row[0] or f"Org{org_id}",
+        "support_name": row[1] or f"Tenant{org_id} Support",
+        "support_email": row[2] or "",
+        "website": row[3] or "",
+        "kb_text": row[4] or "",
+        "system_prompt": row[5] or "",
+        "auto_reply": int(row[6]) if row[6] is not None else 1,
+        "max_replies_per_hour": int(row[7]) if row[7] is not None else 10,
+    }
+
+
+def replies_sent_last_hour(org_id: int) -> int:
+    """
+    Count reply_logs in last 60 minutes (works if created_at exists and is YYYY-MM-DD HH:MM:SS).
+    """
+    # Prefer SQLAlchemy engine (same DB), fallback to sqlite direct if needed.
+    try:
+        with engine.connect() as conn:
+            res = conn.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM reply_logs
+                    WHERE org_id = :oid
+                      AND created_at >= datetime('now','-1 hour')
+                    """
+                ),
+                {"oid": org_id},
+            ).scalar_one()
+        return int(res or 0)
+    except Exception:
+        try:
+            db_path = db_path_local()
+            con = sqlite3.connect(db_path)
+            cur = con.cursor()
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM reply_logs
+                WHERE org_id = ?
+                  AND created_at >= datetime('now','-1 hour')
+                """,
+                (org_id,),
+            )
+            n = cur.fetchone()[0]
+            con.close()
+            return int(n or 0)
+        except Exception:
+            return 0
+
+
+def already_replied(org_id: int, message_id: str) -> bool:
+    if not message_id:
+        return False
+    with engine.connect() as conn:
+        exists = conn.execute(
+            text("SELECT 1 FROM replied_messages WHERE org_id=:oid AND message_id=:mid"),
+            {"oid": org_id, "mid": message_id},
+        ).fetchone()
+    return bool(exists)
+
+
+def mark_replied(org_id: int, message_id: str):
+    if not message_id:
+        return
+    with engine.connect() as conn:
+        conn.execute(
+            text("INSERT OR IGNORE INTO replied_messages (org_id, message_id) VALUES (:oid, :mid)"),
+            {"oid": org_id, "mid": message_id},
+        )
+        conn.commit()
+
+
+def send_smtp_safe(a: EmailAccount, to_email: str, subject: str, body: str) -> bool:
+    """
+    SMTP can fail on GoDaddy sometimes. We retry a few times.
+    """
+    if not to_email:
+        return False
+
+    msg_out = EmailMessage()
+    msg_out["From"] = a.email
+    msg_out["To"] = to_email
+    msg_out["Subject"] = subject
+    msg_out.set_content(body)
+
+    for attempt in range(3):
+        try:
+            print(f"SMTP attempt {attempt+1}/3")
+            with smtplib.SMTP_SSL("smtpout.secureserver.net", 465, timeout=60) as smtp:
+                smtp.ehlo()
+                time.sleep(1)
+                smtp.login(a.email, a.imap_password)
+                time.sleep(1)
+                smtp.send_message(msg_out)
+            print("SMTP SUCCESS")
+            return True
+        except Exception as e:
+            print("SMTP ERROR:", repr(e))
+            time.sleep(3)
+
+    return False
+
+
+def normalize_thread_key(message_id: str, in_reply_to: str, references: str) -> str:
+    """
+    Create a stable thread key.
+    Preference:
+      1) In-Reply-To
+      2) last item in References
+      3) Message-ID
+    """
+    in_reply_to = (in_reply_to or "").strip()
+    references = (references or "").strip()
+    message_id = (message_id or "").strip()
+
+    if in_reply_to:
+        return in_reply_to
+
+    if references:
+        parts = [p.strip() for p in references.split() if p.strip()]
+        if parts:
+            return parts[-1]
+
+    return message_id or "no-message-id"
+
+
+def load_thread_context(org_id: int, thread_key: str, limit: int = 6) -> str:
+    """
+    Load last N messages for the same thread_key from conversations table (sqlite).
+    Returns a compact context string for prompt.
+    """
+    if not thread_key:
+        return ""
+
+    db_path = db_path_local()
+    try:
+        con = sqlite3.connect(db_path)
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT customer_message, ai_reply, created_at
+            FROM conversations
+            WHERE org_id = ? AND thread_key = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (org_id, thread_key, limit),
+        )
+        rows = cur.fetchall()
+        con.close()
+    except Exception:
+        return ""
+
+    if not rows:
+        return ""
+
+    rows = list(reversed(rows))  # oldest -> newest
+    chunks = []
+    for i, (cust, ai, created_at) in enumerate(rows, start=1):
+        cust = (cust or "").strip()
+        ai = (ai or "").strip()
+        created_at = (created_at or "").strip()
+        if not cust and not ai:
+            continue
+        chunks.append(
+            f"[{i}] ({created_at})\nCustomer:\n{cust[:1200]}\n\nAssistant:\n{ai[:1200]}\n"
+        )
+
+    return "\n".join(chunks).strip()
+
+
+def build_prompt(org_settings: dict, subject: str, sender: str, body: str, thread_context: str) -> tuple[str, str]:
+    """
+    Returns: (system_prompt, user_prompt)
+    """
+    support_name = (org_settings.get("support_name") or "").strip() or "Support Team"
+    support_email = (org_settings.get("support_email") or "").strip()
+
+    website = (org_settings.get("website") or "").strip()
+    kb_text = (org_settings.get("kb_text") or "").strip()
+    sys_rules = (org_settings.get("system_prompt") or "").strip()
+
+    default_system = """You are the official email support assistant for this organization.
+Rules:
+- Be professional, concise, and helpful.
+- Do not hallucinate. Use only KB/website/context provided.
+- If you don't know a fact (fees, prices, phone numbers, addresses, availability), ask 1–3 clarifying questions.
+- Write a natural email reply (no JSON, no markdown).
+"""
+    system_prompt = sys_rules or default_system
+
+    # Keep user message as the "context pack"
+    user_prompt = f"""INCOMING EMAIL
+Subject: {subject}
+From: {sender}
+
+Message:
+{body}
+
+ORG WEBSITE (as reference, not for browsing):
+{website if website else "(not provided)"}
+
+ORG KNOWLEDGE BASE (KB):
+{kb_text if kb_text else "(not provided)"}
+
+THREAD CONTEXT (previous messages in this same email chain):
+{thread_context if thread_context else "(no previous context)"}
+
+INSTRUCTIONS
+- Reply as the organization support team.
+- Do NOT invent facts. If missing info, ask short questions.
+- Keep it concise and actionable.
+- Output ONLY the email body.
+
+SIGNATURE (must be exactly this at end):
+
+Best regards,
+
+{support_name}
+{support_email}
+"""
+    return system_prompt, user_prompt
+
+
+def store_conversation(org_id: int, thread_key: str, message_id: str, customer_email: str, subject: str, customer_body: str, ai_reply: str):
+    """
+    conversations table may have different columns; insert safely using PRAGMA.
+    """
+    db_path = db_path_local()
+    data = {
+        "org_id": org_id,
+        "thread_key": thread_key,
+        "message_id": message_id,
+        "customer_email": customer_email,
+        "subject": subject,
+        "customer_message": customer_body,
+        "ai_reply": ai_reply,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    try:
+        flexible_insert_sqlite(db_path, "conversations", data)
+    except Exception:
+        pass
+
+
+def store_reply_log(org_id: int, message_id: str, to_email: str, subject: str, ai_reply: str, status: str, error_text: str = ""):
+    """
+    reply_logs table may have different columns; insert safely using PRAGMA.
+    """
+    db_path = db_path_local()
+    data = {
+        "org_id": org_id,
+        "message_id": message_id,
+        "to_email": to_email,
+        "subject": subject,
+        "reply": ai_reply,
+        "status": status,
+        "error": error_text,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    try:
+        flexible_insert_sqlite(db_path, "reply_logs", data)
+    except Exception:
+        pass
+
+
+def search_candidate_ids(imap) -> list:
+    """
+    Prefer UNSEEN to reduce repeated scanning.
+    Fallback to ALL if UNSEEN not supported or empty.
+    """
+    try:
+        st, msg = imap.search(None, "UNSEEN")
+        if st == "OK" and msg and msg[0]:
+            ids = msg[0].split()
+            if ids:
+                return ids
+    except Exception:
+        pass
+
+    st, msg = imap.search(None, "ALL")
+    if st != "OK" or not msg or not msg[0]:
+        return []
+    return msg[0].split()
+
+
+# ---------- main ----------
+def main():
+    print("IMAP Worker started...\n")
+
+    load_dotenv()
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    with Session(engine) as db:
+        accounts = db.query(EmailAccount).all()
+
+    for a in accounts:
+        org_id = int(a.org_id)
+        org_settings = get_org_settings(org_id)
+
+        # Auto reply flag (per org)
+        if not org_settings.get("auto_reply", 1):
+            print(f"Connecting IMAP: {a.imap_username}")
+            print("Auto-reply disabled for this organization. Skipping.\n")
+            continue
+
+        # Rate limit (per org)
+        sent_last_hour = replies_sent_last_hour(org_id)
+        max_per_hour = int(org_settings.get("max_replies_per_hour", 10) or 10)
+        if sent_last_hour >= max_per_hour:
+            print(f"Connecting IMAP: {a.imap_username}")
+            print(f"Rate limited: {sent_last_hour}/{max_per_hour} replies in last hour. Skipping.\n")
+            # log rate limit hit (optional)
+            store_reply_log(
+                org_id=org_id,
+                message_id="",
+                to_email="",
+                subject="",
+                ai_reply="",
+                status="rate_limited",
+                error_text=f"Rate limited {sent_last_hour}/{max_per_hour} in last hour",
+            )
+            continue
+
+        for attempt in range(2):  # retry IMAP once
+            imap = None
+            try:
+                if attempt == 0:
+                    print(f"Connecting IMAP: {a.imap_username}")
+                else:
+                    print(f"Retrying IMAP ({attempt+1}/2): {a.imap_username}")
+
+                imap = imaplib.IMAP4_SSL(a.imap_host, a.imap_port)
+                imap.login(a.imap_username, a.imap_password)
+                imap.select(INBOX_FOLDER)
+
+                ids = search_candidate_ids(imap)
+                if not ids:
+                    imap.logout()
+                    print("No emails found.\n")
+                    break
+
+                # Find latest non-marketing/system email from last SCAN_LAST_N
+                chosen_mid = None
+                chosen_hdr = ""
+                for mid in reversed(ids[-SCAN_LAST_N:]):
+                    st, hdrdata = imap.fetch(
+                        mid,
+                        "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID REFERENCES IN-REPLY-TO)])",
+                    )
+                    if not hdrdata or not isinstance(hdrdata[0], tuple):
+                        continue
+                    hdr = safe_decode(hdrdata[0][1])
+                    hdr_l = hdr.lower()
+                    if is_ignored_email(hdr_l):
+                        continue
+                    chosen_mid = mid
+                    chosen_hdr = hdr
+                    break
+
+                if chosen_mid is None:
+                    imap.logout()
+                    print("No suitable (non-marketing/system) emails found.\n")
+                    break
+
+                # Fetch full email
+                st, data = imap.fetch(chosen_mid, "(BODY.PEEK[])")
+                if not data or not isinstance(data[0], tuple):
+                    imap.logout()
+                    print("Failed to fetch email body.\n")
+                    break
+
+                msg = message_from_bytes(data[0][1], policy=default)
+
+                subject = msg.get("Subject", "") or ""
+                sender = msg.get("From", "") or ""
+                message_id = (msg.get("Message-ID", "") or "").strip()
+
+                in_reply_to = (msg.get("In-Reply-To", "") or "").strip()
+                references = (msg.get("References", "") or "").strip()
+                thread_key = normalize_thread_key(message_id, in_reply_to, references)
+
+                print("\nSelected Email:")
+                print("Subject:", subject)
+                print("From:", sender)
+                print("Message-ID:", message_id)
+                print("Thread-Key:", thread_key)
+
+                # Ignore (double check) based on subject/from too
+                hdr_combo = f"{subject}\n{sender}\n{message_id}".lower()
+                if is_ignored_email(hdr_combo):
+                    print("Ignored (marketing/system email) — Skipping.\n")
+                    imap.logout()
+                    break
+
+                # Already replied check (per org + message-id)
+                if message_id and already_replied(org_id, message_id):
+                    print("Already replied to this Message-ID. Skipping send.\n")
+                    imap.logout()
+                    break
+
+                # Body text
+                body = get_body_text(msg)
+                body_l = (body or "").lower()
+
+                # Enquiry detection (keep, but also allow subject trigger)
+                enquiry_keywords = [
+                    "price", "pricing", "cost", "quote", "details", "fee", "fees",
+                    "interested", "information", "brochure",
+                    "services", "website", "app development",
+                    "digital marketing", "seo", "branding",
+                    "enquiry", "inquiry", "contact", "call", "admission", "join"
+                ]
+                subject_l = (subject or "").lower()
+                if not (any(k in body_l for k in enquiry_keywords) or any(k in subject_l for k in enquiry_keywords)):
+                    print("No clear enquiry detected. Skipping.\n")
+                    imap.logout()
+                    break
+
+                print("ENQUIRY DETECTED → Generating reply")
+
+                # Load previous conversation context for this thread
+                thread_context = load_thread_context(org_id, thread_key, limit=6)
+
+                # Close IMAP before OpenAI call to avoid connection drops
+                try:
+                    imap.logout()
+                except Exception:
+                    pass
+                imap = None
+
+                system_prompt, user_prompt = build_prompt(
+                    org_settings=org_settings,
+                    subject=subject,
+                    sender=sender,
+                    body=body,
+                    thread_context=thread_context,
+                )
+
+                print(f"[ORG] org_id={org_id} kb_len={len((org_settings.get('kb_text') or ''))} sys_len={len((org_settings.get('system_prompt') or ''))}")
+
+                print("Calling OpenAI...")
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                )
+
+                reply = (response.choices[0].message.content or "").strip()
+                print("---- AI REPLY (preview) ----")
+                print(reply[:800])
+
+                to_email = extract_email(sender)
+
+                # SMTP send
+                smtp_ok = send_smtp_safe(a, to_email, "Re: " + subject, reply)
+
+                # Always store conversation + reply log
+                store_conversation(org_id, thread_key, message_id, to_email, subject, body, reply)
+                store_reply_log(
+                    org_id=org_id,
+                    message_id=message_id,
+                    to_email=to_email,
+                    subject=subject,
+                    ai_reply=reply,
+                    status="sent" if smtp_ok else "smtp_failed",
+                    error_text="" if smtp_ok else "SMTP failed after retries",
+                )
+
+                # Only mark replied if SMTP succeeded (prevents repeated attempts when SMTP fails)
+                if smtp_ok and message_id:
+                    mark_replied(org_id, message_id)
+                    print("Reply recorded + conversation stored.\n")
+                else:
+                    print("SMTP FAILED — reply NOT recorded in replied_messages (but logged).\n")
+
+                break  # done for this account
+
+            except (ConnectionResetError, imaplib.IMAP4.abort, OSError) as e:
+                print("NETWORK/IMAP ERROR:", repr(e))
+                try:
+                    if imap:
+                        imap.logout()
+                except Exception:
+                    pass
+                time.sleep(2)
+                if attempt == 0:
+                    continue
+                break
+
+            except Exception as e:
+                print("WORKER ERROR:", repr(e))
+                try:
+                    if imap:
+                        imap.logout()
+                except Exception:
+                    pass
+                break
+
+
+if __name__ == "__main__":
+    main()

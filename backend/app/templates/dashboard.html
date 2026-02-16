@@ -1,0 +1,99 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AI Mail SaaS - Dashboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; }
+    h1 { margin: 0 0 8px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #eee; }
+    .muted { color: #666; font-size: 12px; }
+    .tag { display:inline-block; padding:2px 8px; border:1px solid #ccc; border-radius:999px; font-size:12px; }
+  </style>
+</head>
+<body>
+  <h1>AI Mail SaaS - Admin Dashboard</h1>
+  <div class="muted">Local dashboard (read-only)</div>
+
+  <div class="grid" style="margin-top:16px;">
+    <div class="card">
+	  <h3>Organizations</h3>
+	  <table>
+		<thead>
+		  <tr>
+			<th>ID</th><th>Name</th><th>Plan</th><th>Remaining</th><th>Actions</th>
+		  </tr>
+		</thead>
+		<tbody>
+		  {% for o in orgs %}
+		  <tr>
+			<td>{{ o.id }}</td>
+			<td>{{ o.name }}</td>
+			<td><span class="tag">{{ o.plan }}</span></td>
+			<td>{{ o.remaining }}</td>
+			<td>
+			  <form method="post" action="/admin/set-plan" style="display:flex; gap:8px; align-items:center;">
+				<input type="hidden" name="org_id" value="{{ o.id }}">
+				<input type="hidden" name="pw" value="{{ pw }}">
+				<select name="plan">
+				  <option value="free" {% if o.plan=='free' %}selected{% endif %}>free</option>
+				  <option value="pro" {% if o.plan=='pro' %}selected{% endif %}>pro</option>
+				  <option value="enterprise" {% if o.plan=='enterprise' %}selected{% endif %}>enterprise</option>
+				</select>
+				<button type="submit">Set</button>
+			  </form>
+			</td>
+		  </tr>
+		  {% endfor %}
+		</tbody>
+	  </table>
+	</div>
+
+    <div class="card">
+      <h3>Email Accounts</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Org</th><th>Email</th><th>Host</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for a in accounts %}
+          <tr>
+            <td>{{ a.org_id }}</td>
+            <td>{{ a.email }}</td>
+            <td>{{ a.imap_host }}:{{ a.imap_port }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px;">
+    <h3>Recent Usage (last 50)</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th><th>Org</th><th>Event</th><th>Qty</th><th>Meta</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for u in usage %}
+        <tr>
+          <td>{{ u.created_at }}</td>
+          <td>{{ u.org_id }}</td>
+          <td>{{ u.event }}</td>
+          <td>{{ u.qty }}</td>
+          <td class="muted">{{ u.meta }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+</body>
+</html>
