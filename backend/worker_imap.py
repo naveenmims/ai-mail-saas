@@ -1,4 +1,4 @@
-﻿"""
+"""
 worker_imap.py (Postgres-only / C3)
 
 ✅ What changed (without breaking behavior):
@@ -11,6 +11,7 @@ Everything else (IMAP filtering, OpenAI, locks, billing, observability) stays th
 """
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
 import os
@@ -39,6 +40,8 @@ from app.db import engine, SessionLocal
 from app.services.billing_guard import get_remaining_credits, consume_credits, log_usage
 from app.services.observability import upsert_worker_status, log_conversation, now_utc
 from app.models import Organization, EmailAccount
+
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
 
 # --- Windows/Console UTF-8 safety (prevents UnicodeEncodeError) ---
 try:
@@ -106,11 +109,13 @@ def read_text_file(path: str) -> str:
         return ""
     return p.read_text(encoding="utf-8", errors="ignore").strip()
 
+
 def safe_decode(b) -> str:
     try:
         return b.decode(errors="ignore")
     except Exception:
         return ""
+
 
 def norm_mid(mid: str | None) -> str | None:
     if not mid:
@@ -119,6 +124,7 @@ def norm_mid(mid: str | None) -> str | None:
     if mid.startswith("<") and mid.endswith(">"):
         mid = mid[1:-1].strip()
     return mid
+
 
 def extract_email(from_header: str) -> str:
     """
@@ -132,6 +138,7 @@ def extract_email(from_header: str) -> str:
         return m.group(1).strip()
     return from_header.strip().strip('"')
 
+
 def is_ignored_email(text_lower: str) -> bool:
     """
     Pass lowercase text. Returns True if it's marketing/system based on static lists.
@@ -144,24 +151,80 @@ def is_ignored_email(text_lower: str) -> bool:
         return True
     return False
 
-def is_security_alert_email(subject: str, body: str, headers: str = "") -> bool:
-    """
-    Detect security/system notifications (OTP, password reset, suspicious activity etc.)
-    Uses focused phrases (not loose "signin" keyword).
-    """
-    s = (subject or "").lower()
-    b = (body or "").lower()
-    h = (headers or "").lower()
-    text_all = "\n".join([s, b, h])
 
-    security_signals = [
-        "security alert", "new sign-in", "new login", "sign-in attempt",
-        "password reset", "reset your password",
-        "verification code", "one-time password", "otp",
-        "suspicious activity", "unusual activity",
-        "account activity",
-    ]
-    return any(x in text_all for x in security_signals)
+def is_security_alert_email(subject: str, body: str, raw_headers) -> bool:
+    """
+    STRICT system/security filter.
+    Return True only when we are highly confident the message is automated security/system noise
+    (bounces, delivery reports, auto-generated alerts, list mail).
+    """
+    subj = (subject or "").lower()
+    text_ = (body or "").lower()
+
+    # raw_headers can be dict-like or string; normalize
+    try:
+        hdr_str = "\n".join([f"{k}: {v}" for k, v in (raw_headers or {}).items()]).lower()
+    except Exception:
+        hdr_str = str(raw_headers or "").lower()
+
+    combined = f"{subj}\n{text_}\n{hdr_str}"
+
+    # Strong automated/system signals (headers)
+    auto_header_signals = (
+        "auto-submitted: auto-generated" in combined
+        or "auto-submitted: auto-replied" in combined
+        or "x-autoreply" in combined
+        or "x-auto-response-suppress" in combined
+        or "precedence: bulk" in combined
+        or "precedence: junk" in combined
+        or "precedence: list" in combined
+        or "list-id:" in combined
+        or "list-unsubscribe:" in combined
+        or "feedback-id:" in combined
+    )
+
+    # Bounce / DSN / delivery failure patterns
+    bounce_signals = (
+        "mailer-daemon" in combined
+        or "postmaster@" in combined
+        or "delivery status notification" in combined
+        or "undelivered mail" in combined
+        or "returned mail" in combined
+        or "diagnostic-code:" in combined
+        or "final-recipient:" in combined
+        or "x-failed-recipients:" in combined
+        or "report-type=delivery-status" in combined
+        or "message/delivery-status" in combined
+    )
+
+    # Security-alert style keywords (NOT enough alone to skip)
+    security_keywords = (
+        "security alert" in combined
+        or "suspicious sign" in combined
+        or "new sign-in" in combined
+        or "new login" in combined
+        or "unusual activity" in combined
+        or "verify your account" in combined
+        or "password reset" in combined
+        or "reset your password" in combined
+        or "2-step verification" in combined
+        or "two-step verification" in combined
+        or "verification code" in combined
+        or "one-time password" in combined
+        or "otp" in combined
+    )
+
+    # The key rule:
+    # - Always skip bounces/DSNs
+    # - Skip security alerts ONLY if also auto-generated (headers) or clearly bulk/list
+    if bounce_signals:
+        return True
+
+    if security_keywords and auto_header_signals:
+        return True
+
+    return False
+
 
 def is_trusted_sender(sender_email: str, org_settings: dict) -> bool:
     """
@@ -185,6 +248,7 @@ def is_trusted_sender(sender_email: str, org_settings: dict) -> bool:
         org_domain = website.split("://", 1)[1].split("/", 1)[0]
     elif website:
         org_domain = website.split("/", 1)[0]
+
     if support_email and "@" in support_email:
         org_domain = support_email.split("@", 1)[1]
 
@@ -194,6 +258,7 @@ def is_trusted_sender(sender_email: str, org_settings: dict) -> bool:
             return True
 
     return se in trusted
+
 
 def get_body_text(msg) -> str:
     """
@@ -222,8 +287,8 @@ def get_body_text(msg) -> str:
 
     return ""
 
-# ---------------------- Postgres-backed settings / history ----------------------
 
+# ---------------------- Postgres-backed settings / history ----------------------
 def get_org_settings(org_id: int) -> dict:
     """
     Load org settings from Postgres (organizations).
@@ -261,6 +326,7 @@ def get_org_settings(org_id: int) -> dict:
         "cooldown_hours": int(getattr(org, "cooldown_hours", 24) or 24),
     }
 
+
 def replies_sent_last_hour(org_id: int) -> int:
     """
     Count replies in last 60 minutes using org_usage table (Postgres).
@@ -268,20 +334,24 @@ def replies_sent_last_hour(org_id: int) -> int:
     try:
         with engine.connect() as conn:
             res = conn.execute(
-                text("""
+                text(
+                    """
                     SELECT COALESCE(SUM(qty), 0)
                     FROM org_usage
                     WHERE org_id = :oid
                       AND event = 'reply_sent'
                       AND created_at >= (NOW() AT TIME ZONE 'utc') - INTERVAL '1 hour'
-                """),
+                    """
+                ),
                 {"oid": org_id},
             ).scalar_one()
         return int(res or 0)
     except Exception:
         return 0
 
+
 SUBJECT_PREFIX_RE = re.compile(r"^\s*((re|fw|fwd)\s*:\s*)+", re.IGNORECASE)
+
 
 def normalize_subject(s: str) -> str:
     s = (s or "").strip()
@@ -289,10 +359,12 @@ def normalize_subject(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s[:180]
 
+
 def extract_msgids(refs_header: str):
     if not refs_header:
         return []
     return re.findall(r"<[^>]+>", refs_header)
+
 
 def make_thread_key(
     org_id: int,
@@ -312,6 +384,7 @@ def make_thread_key(
     h = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
     return f"s:{h}"
 
+
 def replied_to_thread_recently(org_id: int, thread_key: str, hours: int) -> bool:
     """
     Cooldown check: uses conversation_audit OUT rows (Postgres).
@@ -321,7 +394,8 @@ def replied_to_thread_recently(org_id: int, thread_key: str, hours: int) -> bool
     try:
         with engine.connect() as conn:
             row = conn.execute(
-                text("""
+                text(
+                    """
                     SELECT 1
                     FROM conversation_audit
                     WHERE org_id = :oid
@@ -329,12 +403,14 @@ def replied_to_thread_recently(org_id: int, thread_key: str, hours: int) -> bool
                       AND direction = 'OUT'
                       AND created_at >= (NOW() AT TIME ZONE 'utc') - (:hrs * INTERVAL '1 hour')
                     LIMIT 1
-                """),
+                    """
+                ),
                 {"oid": org_id, "tkey": thread_key, "hrs": int(hours)},
             ).fetchone()
         return bool(row)
     except Exception:
         return False
+
 
 def replied_to_sender_recently(org_id: int, sender_email: str, hours: int) -> bool:
     """
@@ -346,7 +422,8 @@ def replied_to_sender_recently(org_id: int, sender_email: str, hours: int) -> bo
     try:
         with engine.connect() as conn:
             row = conn.execute(
-                text("""
+                text(
+                    """
                     SELECT 1
                     FROM conversation_audit
                     WHERE org_id = :oid
@@ -354,12 +431,14 @@ def replied_to_sender_recently(org_id: int, sender_email: str, hours: int) -> bo
                       AND direction = 'OUT'
                       AND created_at >= (NOW() AT TIME ZONE 'utc') - (:hrs * INTERVAL '1 hour')
                     LIMIT 1
-                """),
+                    """
+                ),
                 {"oid": org_id, "email": sender_email, "hrs": int(hours)},
             ).fetchone()
         return bool(row)
     except Exception:
         return False
+
 
 def already_replied(org_id: int, message_id: str) -> bool:
     if not message_id:
@@ -368,19 +447,22 @@ def already_replied(org_id: int, message_id: str) -> bool:
     try:
         with engine.connect() as conn:
             row = conn.execute(
-                text("""
+                text(
+                    """
                     SELECT 1
                     FROM conversation_audit
                     WHERE org_id = :oid
                       AND email_message_id = :mid
                       AND direction = 'OUT'
                     LIMIT 1
-                """),
+                    """
+                ),
                 {"oid": org_id, "mid": message_id},
             ).fetchone()
         return bool(row)
     except Exception:
         return False
+
 
 def thread_needs_reply(org_id: int, thread_key: str) -> bool:
     if not thread_key:
@@ -389,14 +471,16 @@ def thread_needs_reply(org_id: int, thread_key: str) -> bool:
     try:
         with engine.connect() as conn:
             row = conn.execute(
-                text("""
+                text(
+                    """
                     SELECT
                         MAX(CASE WHEN direction = 'IN' THEN created_at END) AS last_in,
                         MAX(CASE WHEN direction = 'OUT' THEN created_at END) AS last_out
                     FROM conversation_audit
                     WHERE org_id = :oid
                       AND thread_key = :tkey
-                """),
+                    """
+                ),
                 {"oid": org_id, "tkey": thread_key},
             ).fetchone()
 
@@ -413,12 +497,14 @@ def thread_needs_reply(org_id: int, thread_key: str) -> bool:
     except Exception:
         return True
 
+
 def mark_replied(org_id: int, message_id: str):
     """
     Deprecated in C3: we record replies via conversation_audit OUT rows.
     Kept as no-op for backward compatibility.
     """
     return
+
 
 def mark_seen_by_relogin(a: EmailAccount, imap_host: str, imap_port: int, mid):
     """
@@ -433,6 +519,7 @@ def mark_seen_by_relogin(a: EmailAccount, imap_host: str, imap_port: int, mid):
         im.logout()
     except Exception:
         pass
+
 
 def send_smtp_safe(a: EmailAccount, to_email: str, subject: str, body: str) -> bool:
     if not to_email:
@@ -463,6 +550,7 @@ def send_smtp_safe(a: EmailAccount, to_email: str, subject: str, body: str) -> b
 
     return False
 
+
 def load_thread_context(org_id: int, thread_key: str, limit: int = 6) -> str:
     """
     Thread context from Postgres conversation_audit (keeps similar formatting).
@@ -473,13 +561,15 @@ def load_thread_context(org_id: int, thread_key: str, limit: int = 6) -> str:
     try:
         with engine.connect() as conn:
             rows = conn.execute(
-                text("""
+                text(
+                    """
                     SELECT direction, body_text, created_at
                     FROM conversation_audit
                     WHERE org_id = :oid AND thread_key = :tkey
                     ORDER BY created_at DESC
                     LIMIT :lim
-                """),
+                    """
+                ),
                 {"oid": org_id, "tkey": thread_key, "lim": int(limit) * 2},  # IN+OUT
             ).fetchall()
 
@@ -519,12 +609,15 @@ def load_thread_context(org_id: int, thread_key: str, limit: int = 6) -> str:
     except Exception:
         return ""
 
+
 # Keep these as no-op to avoid disturbing old flow/call sites.
 def store_conversation(*args, **kwargs):
     return
 
+
 def store_reply_log(*args, **kwargs):
     return
+
 
 def search_candidate_ids(imap) -> list:
     try:
@@ -541,44 +634,67 @@ def search_candidate_ids(imap) -> list:
         return []
     return msg[0].split()
 
+
 # ---------- main ----------
 replied_mids_this_run = set()
 replied_threads_this_run = set()
 
-def is_real_enquiry(subject: str, sender: str, body: str, raw_headers: str = "", trusted_sender: bool = False) -> bool:
+
+def is_real_enquiry(
+    subject: str,
+    sender: str,
+    body: str,
+    raw_headers: str = "",
+    trusted_sender: bool = False,
+) -> bool:
     s = (subject or "").lower().strip()
     f = (sender or "").lower().strip()
     b = (body or "").lower().strip()
     h = (raw_headers or "").lower().strip()
-    combined = "\n".join([s, f, h, b])
 
+    combined = "\n".join([s, f, h, b])
+    combined_h = "\n".join([s, f, h])
+
+    # debug reason tracker
+    is_real_enquiry.last_reason = ""
+
+    # Bulk signals: check ONLY subject+from+headers (NOT body)
     bulk_signals = [
         "list-unsubscribe", "list-id", "list-help", "list-post",
         "unsubscribe", "manage preferences", "view in browser",
         "you are receiving this email because", "email preferences",
         "newsletter", "promotion", "campaign", "marketing",
     ]
-    hit = next((x for x in bulk_signals if x in combined), None)
+    hit = next((x for x in bulk_signals if x in combined_h), None)
     if hit and (not trusted_sender):
+        is_real_enquiry.last_reason = f"bulk:{hit}"
         return False
 
+    # Strict security/system filter (bypass for trusted)
     if (not trusted_sender) and is_security_alert_email(subject, body, raw_headers):
+        is_real_enquiry.last_reason = "security_alert"
         return False
 
+    # Static ignore lists (keywords + senders). This checks combined (includes body)
     ignored = is_ignored_email(combined)
     if DEBUG:
         print(f"[DEBUG is_real_enquiry] ignored={ignored} trusted_sender={trusted_sender}")
+
     if (not trusted_sender) and ignored:
+        is_real_enquiry.last_reason = "ignored_static"
         return False
 
+    # Subject contains enquiry-like signals
     if 3 <= len(s) <= 90:
         subject_signals = [
             "web", "website", "design", "developer", "consultant",
             "seo", "marketing", "app", "service", "quote", "pricing", "cost", "fees"
         ]
         if any(x in s for x in subject_signals):
+            is_real_enquiry.last_reason = "ok"
             return True
 
+    # Positive intent signals anywhere in combined
     positive = [
         "enquiry", "inquiry", "quote", "quotation", "estimate",
         "pricing", "price", "fees", "fee", "cost",
@@ -591,14 +707,18 @@ def is_real_enquiry(subject: str, sender: str, body: str, raw_headers: str = "",
         "ui", "ux", "digital marketing", "branding", "app development",
     ]
     if any(p in combined for p in positive):
+        is_real_enquiry.last_reason = "ok"
         return True
 
+    # Human-ish short body with question
     if 20 <= len(b) <= 600:
         human_signals = ["hi", "hello", "dear", "please", "kindly", "thanks", "thank you"]
         if any(hs in b for hs in human_signals) or "?" in b:
+            is_real_enquiry.last_reason = "ok"
             return True
 
     return False
+
 
 def build_prompt(org_settings: dict, subject: str, sender: str, body: str, thread_context: str) -> tuple[str, str]:
     kb_text = (org_settings.get("kb_text") or "").strip()
@@ -660,6 +780,7 @@ ORG KNOWLEDGE BASE (KB):
 {kb_text if kb_text else "(not provided)"}
 """
     return system_prompt, user_prompt
+
 
 def main():
     print("IMAP Worker started...\n")
@@ -731,6 +852,7 @@ def main():
             body = ""
             in_reply_to = None
             references_header = ""
+            chosen_hdr = ""
             smtp_ok = False
             reply = ""
 
@@ -750,7 +872,7 @@ def main():
                     print("No emails found.\n")
                     break
 
-                chosen_hdr = ""
+                # choose a non-marketing email based on headers
                 for mid in reversed(ids[-SCAN_LAST_N:]):
                     st, hdrdata = imap.fetch(
                         mid,
@@ -781,14 +903,16 @@ def main():
                 subject = msg.get("Subject", "") or ""
                 sender = msg.get("From", "") or ""
                 message_id = (msg.get("Message-ID", "") or "").strip()
+                message_id_n = norm_mid(message_id) or ""
 
                 body = get_body_text(msg)
                 sender_email = extract_email(sender)
 
-                in_reply_to = (msg.get("In-Reply-To") or "").strip()
-                references_header = (msg.get("References") or "").strip()
+                in_reply_to = (msg.get("In-Reply-To") or "").strip() or None
+                references_header = (msg.get("References") or "").strip() or None
 
                 thread_key = make_thread_key(org_id, sender_email, subject, in_reply_to, references_header)
+                thread_key_n = (thread_key or "").strip().lower() if thread_key else ""
 
                 print("\nSelected Email:")
                 print("Subject:", subject)
@@ -796,7 +920,7 @@ def main():
                 print("Message-ID:", message_id)
                 print("Thread-Key:", thread_key)
 
-                logger.info(f"event=email_selected org={org_slug} message_id={message_id} thread_key={thread_key}")
+                logger.info(f"event=email_selected org={org_slug} message_id={message_id_n} thread_key={thread_key}")
 
                 hdr_combo = f"{subject}\n{sender}\n{message_id}".lower()
                 if is_ignored_email(hdr_combo):
@@ -804,31 +928,36 @@ def main():
                     imap.logout()
                     break
 
-                # C3 duplicate protection
-                try:
-                    with engine.connect() as conn:
-                        already = conn.execute(
-                            text("""
-                                SELECT 1
-                                FROM conversation_audit
-                                WHERE org_id = :oid
-                                  AND email_message_id = :mid
-                                  AND direction = 'OUT'
-                                LIMIT 1
-                            """),
-                            {"oid": org_id, "mid": message_id},
-                        ).fetchone()
-                    if already:
-                        print("Already replied (conversation_audit). Skipping.\n")
-                        try:
-                            imap.store(chosen_mid, "+FLAGS", "\\Seen")
-                        except Exception:
-                            pass
+                # Per-message-id de-dupe (DB) early
+                if message_id_n and already_replied(org_id, message_id_n):
+                    print("Already replied to this Message-ID. Skipping send.\n")
+                    try:
+                        imap.store(chosen_mid, "+FLAGS", "\\Seen")
+                    except Exception:
+                        pass
+                    try:
                         imap.logout()
-                        break
-                except Exception as e:
-                    print("WORKER ERROR:", repr(e))
-                    traceback.print_exc()
+                    except Exception:
+                        pass
+                    break
+
+                # In-run de-dupe
+                if message_id_n and message_id_n in replied_mids_this_run:
+                    print("[SKIP] already replied (this run) message_id", message_id_n)
+                    try:
+                        imap.store(chosen_mid, "+FLAGS", "\\Seen")
+                    except Exception:
+                        pass
+                    imap.logout()
+                    break
+                if thread_key_n and thread_key_n in replied_threads_this_run:
+                    print("[SKIP] already replied (this run) thread", thread_key_n)
+                    try:
+                        imap.store(chosen_mid, "+FLAGS", "\\Seen")
+                    except Exception:
+                        pass
+                    imap.logout()
+                    break
 
                 # Thread cooldown (Postgres)
                 if replied_to_thread_recently(org_id, thread_key, hours=cooldown_hours):
@@ -850,32 +979,44 @@ def main():
                 if not thread_key and replied_to_sender_recently(org_id, sender_email, hours=cooldown_hours):
                     print(f"Cooldown(sender): already replied to {sender_email} in last {cooldown_hours}h. Skipping.\n")
                     try:
+                        imap.store(chosen_mid, "+FLAGS", "\\Seen")
+                    except Exception:
+                        pass
+                    try:
                         imap.logout()
                     except Exception:
                         pass
                     continue
 
-                # per-message-id de-dupe
-                if message_id and already_replied(org_id, message_id):
-                    print("Already replied to this Message-ID. Skipping send.\n")
-                    try:
-                        imap.logout()
-                    except Exception:
-                        pass
-                    break
+                trusted_sender = is_trusted_sender(sender_email, org_settings)
 
                 # Security/system filter (bypass for trusted senders)
-                if is_security_alert_email(subject, body, chosen_hdr) and not is_trusted_sender(sender_email, org_settings):
+                if is_security_alert_email(subject, body, str(chosen_hdr or "")) and not trusted_sender:
+                    logger.info(
+                        f"event=security_skip org={org_slug} from={sender_email} thread_key={thread_key} subject={subject[:120]!r}"
+                    )
                     print("Security/system email detected. Skipping.\n")
+                    try:
+                        imap.store(chosen_mid, "+FLAGS", "\\Seen")
+                    except Exception:
+                        pass
                     try:
                         imap.logout()
                     except Exception:
                         pass
                     break
 
-                trusted_sender = is_trusted_sender(sender_email, org_settings)
+                # Enquiry filter
                 if not is_real_enquiry(subject, sender, body, raw_headers=chosen_hdr, trusted_sender=trusted_sender):
+                    reason = getattr(is_real_enquiry, "last_reason", "")
+                    logger.info(
+                        f"event=not_real_enquiry org={org_slug} reason={reason} from={sender_email} thread_key={thread_key} subject={subject[:120]!r}"
+                    )
                     print("Not a real enquiry (likely marketing/system). Skipping.\n")
+                    try:
+                        imap.store(chosen_mid, "+FLAGS", "\\Seen")
+                    except Exception:
+                        pass
                     try:
                         imap.logout()
                     except Exception:
@@ -927,8 +1068,13 @@ def main():
                 if remaining <= 0:
                     print(f"[BILLING] No credits left for org={org_id}. Skipping.\n")
                     logger.info(f"event=blocked_no_credits org={org_slug} remaining={remaining}")
-                    log_usage(engine, org_id, event="blocked_no_credits", qty=1,
-                              meta={"thread_key": thread_key, "from": sender_email})
+                    log_usage(
+                        engine,
+                        org_id,
+                        event="blocked_no_credits",
+                        qty=1,
+                        meta={"thread_key": thread_key, "from": sender_email, "message_id": message_id_n},
+                    )
                     try:
                         imap.store(chosen_mid, "+FLAGS", "\\Seen")
                     except Exception:
@@ -960,57 +1106,51 @@ def main():
                     print("Auto-reply disabled (enterprise toggle) — Skipping.\n")
                     logger.info(f"event=auto_reply_disabled_live org={org_slug}")
                     try:
+                        imap.store(chosen_mid, "+FLAGS", "\\Seen")
+                    except Exception:
+                        pass
+                    try:
                         imap.logout()
                     except Exception:
                         pass
                     break
 
-                message_id_n = norm_mid(message_id)
-                thread_key_n = (thread_key or "").strip().lower() if thread_key else None
-
-                if message_id_n and message_id_n in replied_mids_this_run:
-                    print("[SKIP] already replied (this run) message_id", message_id_n)
-                    continue
-                if thread_key_n and thread_key_n in replied_threads_this_run:
-                    print("[SKIP] already replied (this run) thread", thread_key_n)
-                    continue
-
-                if message_id_n and already_replied(org_id, message_id_n):
-                    print("[SKIP] already replied to message_id", message_id_n)
-                    continue
-
+                # Only reply if new IN > OUT
                 if not thread_needs_reply(org_id, thread_key):
                     print("[SKIP] No new customer message in thread. Already replied.\n")
-                    continue
+                    try:
+                        imap.store(chosen_mid, "+FLAGS", "\\Seen")
+                    except Exception:
+                        pass
+                    try:
+                        imap.logout()
+                    except Exception:
+                        pass
+                    break
 
                 print("ENQUIRY DETECTED -> Generating reply")
 
-                # Log IN
+                # Log IN to Postgres (conversation_audit)
                 db = SessionLocal()
                 try:
-                    if smtp_ok:
-                        log_conversation(
-                            db,
-                            org_id=org_id,
-                            thread_key=thread_key,
-                            direction="OUT",
-                            customer_email=sender_email,
-                            subject=subject,
-                            body_text=reply if smtp_ok else f"(SMTP FAILED)\n\n{reply}",
-                            ai_model=model,
-                            email_message_id=message_id,              # ✅ ADD THIS
-                            in_reply_to=str(in_reply_to) if in_reply_to else None,
-                            references_header=references_header or None,
-                        )
-
-                    else:
-                        # keep worker_status + org_usage logging as you already do
-                        pass
-
+                    log_conversation(
+                        db,
+                        org_id=org_id,
+                        thread_key=thread_key,
+                        direction="IN",
+                        customer_email=sender_email,
+                        subject=subject,
+                        body_text=body,
+                        ai_model=None,
+                        email_message_id=message_id_n or None,
+                        in_reply_to=in_reply_to,
+                        references_header=references_header,
+                    )
                     db.commit()
                 finally:
                     db.close()
 
+                # Build thread context before OpenAI
                 thread_context = load_thread_context(org_id, thread_key, limit=6)
 
                 # Logout before OpenAI
@@ -1034,6 +1174,7 @@ def main():
                     f"sys_len={len((org_settings.get('system_prompt') or ''))}"
                 )
 
+                # OpenAI + SMTP
                 try:
                     print("Calling OpenAI...")
                     response = client.chat.completions.create(
@@ -1047,27 +1188,20 @@ def main():
                     reply = (response.choices[0].message.content or "").strip()
 
                     if reply.strip().upper() == "SKIP_REPLY":
-                        # If our local heuristics already classified as enquiry, don't allow model to skip.
-                        # This prevents false skips.
+                        # Model tried to skip, but local rules marked this as an enquiry. Force a safe generic reply.
                         print("[WARN] Model returned SKIP_REPLY, but local rules marked as enquiry. Forcing a real reply.")
 
-                        # Simple forced reply without another API call (safe, predictable)
+                        support_name = (org_settings.get("support_name") or "Support Team").strip()
+                        support_email = (org_settings.get("support_email") or "").strip()
+
                         reply = (
                             "Hello,\n\n"
                             "Thanks for reaching out. We received your enquiry and we’re happy to help.\n"
-                            "Could you please confirm which course/program you’re interested in and your preferred timing (weekday/weekend)?\n"
-                            "Also share your phone number (optional) if you want a callback.\n\n"
-                            f"Best regards,\n{org_settings.get('support_name','Support Team')}\n{org_settings.get('support_email','')}"
+                            "Could you please share a bit more detail about what you need (service/course/topic) and your preferred mode/timing?\n"
+                            "If you want a callback, share your phone number (optional).\n\n"
+                            f"Best regards,\n{support_name}"
+                            + (f"\n{support_email}" if support_email else "")
                         ).strip()
-
-
-                        continue
-
-                        # Otherwise treat as model mistake and proceed with a normal reply
-                        print("[WARN] Model returned SKIP_REPLY, but local rules say it's a real enquiry. Continuing.")
-                        # Optional: override reply so you don't send empty
-                        reply = "Hi,\n\nThanks for your email. Could you please share what specific course you are interested in (course name) and whether you prefer online or offline? Once I have that, I’ll share the relevant fee structure and details.\n\nBest regards,\nVspaze Support"
-                        print("[DEBUG] OpenAI reply head:", repr(reply[:120]))
 
                     print("---- AI REPLY (preview) ----")
                     print(reply[:800])
@@ -1081,12 +1215,12 @@ def main():
                     smtp_ok = False
                     if not reply:
                         reply = "(generation failed) Please try again later."
-
+                    to_email = sender_email
 
                 # ✅ analytics log line (this is what your /admin/analytics/summary reads)
                 credits_used = 1 if smtp_ok else 0
                 logger.info(
-                    f"event=email_processed org={org_slug} message_id={message_id} thread_key={thread_key} credits={credits_used}"
+                    f"event=email_processed org={org_slug} message_id={message_id_n} thread_key={thread_key} credits={credits_used}"
                 )
 
                 # Log OUT + worker status
@@ -1101,14 +1235,14 @@ def main():
                         subject=subject,
                         body_text=reply if smtp_ok else f"(SMTP FAILED)\n\n{reply}",
                         ai_model=model,
-                        email_message_id=message_id,
+                        email_message_id=message_id_n or None,
                     )
                     upsert_worker_status(
                         db,
                         worker_id=WORKER_ID,
                         last_run_at=now_utc(),
                         last_email_processed_at=now_utc(),
-                        last_email_message_id=message_id,
+                        last_email_message_id=message_id_n or None,
                         last_thread_key=thread_key,
                         lock_health_ok=True,
                         credits_health_ok=True,
@@ -1118,23 +1252,34 @@ def main():
                 finally:
                     db.close()
 
+                # Billing + usage
                 if smtp_ok:
                     ok = consume_credits(engine, org_id, qty=1)
-                    log_usage(engine, org_id, event="reply_sent", qty=1,
-                              meta={"thread_key": thread_key, "to": to_email, "message_id": message_id})
+                    log_usage(
+                        engine,
+                        org_id,
+                        event="reply_sent",
+                        qty=1,
+                        meta={"thread_key": thread_key, "to": to_email, "message_id": message_id_n},
+                    )
                     if not ok:
                         print(f"[BILLING] Warning: credits could not be consumed after send (org={org_id}).")
-                        logger.info(f"event=credits_consume_failed org={org_slug} message_id={message_id}")
+                        logger.info(f"event=credits_consume_failed org={org_slug} message_id={message_id_n}")
                 else:
-                    log_usage(engine, org_id, event="smtp_failed", qty=1,
-                              meta={"thread_key": thread_key, "to": to_email, "message_id": message_id})
+                    log_usage(
+                        engine,
+                        org_id,
+                        event="smtp_failed",
+                        qty=1,
+                        meta={"thread_key": thread_key, "to": to_email, "message_id": message_id_n},
+                    )
 
-                if smtp_ok and chosen_mid is not None:
-                    # We logged out earlier; re-login only to mark seen
+                # Mark seen (requires re-login because we logged out earlier)
+                if chosen_mid is not None:
                     mark_seen_by_relogin(a, a.imap_host, a.imap_port, chosen_mid)
 
-                if smtp_ok and message_id:
-                    mark_replied(org_id, message_id)
+                if smtp_ok and message_id_n:
+                    mark_replied(org_id, message_id_n)
                     print("Reply recorded + conversation stored.\n")
 
                 if message_id_n:
@@ -1197,5 +1342,20 @@ def main():
 
                 break
 
+
 if __name__ == "__main__":
-    main()
+    import time as _time
+    import logging as _logging
+
+    _logging.basicConfig(level=_logging.INFO)
+    _logger = _logging.getLogger("aimail-worker")
+
+    _logger.info("IMAP Worker started (continuous mode)...")
+
+    while True:
+        try:
+            main()
+        except Exception as e:
+            _logger.exception("Worker crashed: %s", e)
+
+        _time.sleep(POLL_SECONDS)
