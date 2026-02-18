@@ -1,24 +1,16 @@
-﻿# Python
-__pycache__/
-*.pyc
-
-# Virtualenv
-venv/
-.venv/
-
-# Env / secrets
-.env
-*.env
-
-# Local databases
-*.db
-*.sqlite
-*.sqlite3
-
-# Logs
-*.log
-nohup.out
-
-# OS
+# OS / editor junk
+*.swp
+*.swo
+*.bak
+*~
 .DS_Store
-Thumbs.db
+
+# Local scratch / backups
+worker_imap.py.bak*
+*.log
+
+# Random accidental files (IPs etc.)
+[0-9]*.[0-9]*.[0-9]*.[0-9]*
+
+# Local org data (keep out of repo unless you explicitly want it)
+org_data/
