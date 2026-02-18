@@ -385,3 +385,13 @@ def ai_reply(payload: ReplyRequest, current_user: User = Depends(get_current_use
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
+from app.db import engine
+
+@app.get("/readyz")
+def readyz():
+    try:
+        with engine.connect() as conn:
+            conn.exec_driver_sql("SELECT 1")
+        return {"status": "ready"}
+    except Exception as e:
+        return {"status": "not_ready", "error": str(e)}
