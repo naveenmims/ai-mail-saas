@@ -382,3 +382,6 @@ class ReplyRequest(BaseModel):
 def ai_reply(payload: ReplyRequest, current_user: User = Depends(get_current_user)):
     reply_text = generate_reply(payload.subject, payload.body)
     return {"reply": reply_text}
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
