@@ -65,6 +65,43 @@ load_env_file()
 # ✅ Create app FIRST
 app = FastAPI(title="AI Mail SaaS")
 templates = Jinja2Templates(directory="app/templates")
+
+from fastapi.openapi.utils import get_openapi
+
+def custom_openapi():
+    # Build the default schema first
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        routes=app.routes,
+        description=app.description,
+    )
+
+    # In production, hide all /admin/* endpoints from the OpenAPI schema (Swagger)
+    if os.getenv("PRODUCTION_MODE") == "1":
+        paths = schema.get("paths", {})
+        hidden = {p: v for p, v in paths.items() if p.startswith("/admin/")}
+        for p in hidden.keys():
+            paths.pop(p, None)
+        schema["paths"] = paths
+
+    return schema
+
+app.openapi = custom_openapi
+
+import os
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.middleware("http")
+async def block_admin_in_production(request: Request, call_next):
+    if os.getenv("PRODUCTION_MODE") == "1" and request.url.path.startswith("/admin"):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Admin API disabled in production. Use website."},
+        )
+    return await call_next(request)
+
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request, stripe_signature: str = Header(None, alias="Stripe-Signature")):
     payload = await request.body()
@@ -378,7 +415,60 @@ def admin_health(
     require_admin(x_admin_token, authorization)
     return {"ok": True, "server_time_utc": datetime.now(timezone.utc).isoformat()}
 
+@app.post("/admin/email-accounts")
+def admin_create_email_account_via_admin(
+    payload: dict,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    authorization: str | None = Header(default=None),
+):
+    require_admin(x_admin_token, authorization)
 
+    org_id = payload.get("org_id")
+    if not org_id:
+        raise HTTPException(status_code=400, detail="org_id required")
+
+    with Session(engine) as db:
+        acc = EmailAccount(
+            org_id=org_id,
+            label=payload.get("label"),
+            email=payload.get("email"),
+            imap_host=payload.get("imap_host"),
+            imap_port=payload.get("imap_port"),
+            imap_username=payload.get("imap_username"),
+            imap_password=payload.get("imap_password"),
+            sendgrid_api_key=payload.get("sendgrid_api_key") or "",
+            from_name=payload.get("from_name"),
+        )
+        db.add(acc)
+        db.commit()
+        db.refresh(acc)
+        return {"id": acc.id, "org_id": acc.org_id}
+
+        
+
+
+@app.get("/admin/email-accounts")
+def admin_list_email_accounts_via_admin(
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    authorization: str | None = Header(default=None),
+):
+    require_admin(x_admin_token, authorization)
+
+    with Session(engine) as db:
+        accs = db.query(EmailAccount).order_by(EmailAccount.id.desc()).limit(200).all()
+        return [
+            {
+                "id": a.id,
+                "org_id": a.org_id,
+                "label": a.label,
+                "email": a.email,
+                "imap_host": a.imap_host,
+                "imap_port": a.imap_port,
+                "imap_username": a.imap_username,
+                "from_name": a.from_name,
+            }
+            for a in accs
+        ]
 app.openapi = custom_openapi
 
 
