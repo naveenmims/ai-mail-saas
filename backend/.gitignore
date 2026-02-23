@@ -14,3 +14,25 @@ worker_imap.py.bak*
 
 # Local org data (keep out of repo unless you explicitly want it)
 org_data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtualenv
+venv/
+.venv/
+
+# Local DB / sqlite artifacts
+*.db
+*.db-wal
+*.db-shm
+
+# Logs
+*.log
+
+# Editor/backup files
+*.bak*
+*.save
