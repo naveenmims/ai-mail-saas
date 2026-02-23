@@ -144,6 +144,9 @@ app.include_router(admin_c3_router)
 app.include_router(billing_router)          # Stripe
 app.include_router(manual_billing_router)   # Manual
 app.include_router(admin_analytics_router)
+from app.api.routes.worker_health import router as worker_health_router
+app.include_router(worker_health_router)
+
 
 # --- Demo routes (token gated) ---
 from app.api.routes.demo import router as demo_router
