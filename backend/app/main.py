@@ -381,11 +381,6 @@ app.openapi = custom_openapi
 app.include_router(admin_analytics_router)
 
 # --- Demo routes (token gated) ---
-from app.api.routes.demo import router as demo_router
-from app.api.routes.demo_data import router as demo_data_router
-app.include_router(demo_router)
-app.include_router(demo_data_router)
-
 
 class ReplyRequest(BaseModel):
     subject: str
