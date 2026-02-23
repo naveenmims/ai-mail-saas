@@ -24,7 +24,6 @@ def _daily_seed() -> int:
     org = os.getenv("DEMO_ORG_NAME", "BookURL Demo").strip()
     salt = os.getenv("DEMO_DASHBOARD_SALT", "v1").strip()
     today = datetime.now(timezone.utc).date().isoformat()
-
     raw = f"{org}|{today}|{salt}".encode("utf-8")
     digest = hashlib.sha256(raw).digest()
     return int.from_bytes(digest[:8], "big", signed=False)
