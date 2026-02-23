@@ -378,7 +378,6 @@ def admin_health(
 
 app.openapi = custom_openapi
 
-app.include_router(admin_analytics_router)
 
 # --- Demo routes (token gated) ---
 
