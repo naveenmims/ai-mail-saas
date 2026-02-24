@@ -25,10 +25,19 @@ def try_acquire_thread_lock(engine, org_id: int, thread_key: str, cooldown_secon
 
         # 2) Try insert (unique index enforces single row per bucket)
         try:
-            conn.execute(text("""
-                INSERT INTO reply_thread_locks (org_id, thread_key, bucket_start, worker_id, expires_at)
-                VALUES (:org_id, :thread_key, :bucket_start, :worker_id, :expires_at)
-            """), {
+            conn.execute(
+                 text("""
+                     INSERT INTO reply_thread_locks (org_id, thread_key, bucket_start, worker_id, expires_at)
+                     VALUES (:org_id, :thread_key, :bucket_start, :worker_id, :expires_at)
+                     ON CONFLICT (org_id, thread_key)
+                     DO UPDATE SET
+                         bucket_start = EXCLUDED.bucket_start,
+                         worker_id    = EXCLUDED.worker_id,
+                         expires_at   = EXCLUDED.expires_at
+                     WHERE reply_thread_locks.expires_at < now()
+                 """),
+                 params
+             ) {
                 "org_id": org_id,
                 "thread_key": thread_key,
                 "bucket_start": bucket_start.isoformat(),
@@ -41,16 +50,15 @@ def try_acquire_thread_lock(engine, org_id: int, thread_key: str, cooldown_secon
             row = conn.execute(text("""
                 SELECT worker_id, expires_at
                 FROM reply_thread_locks
-                WHERE org_id=:org_id AND thread_key=:thread_key AND bucket_start=:bucket_start
+                WHERE org_id=:org_id AND thread_key=:thread_key
                 LIMIT 1
-            """), {
-                "org_id": org_id,
-                "thread_key": thread_key,
-                "bucket_start": bucket_start.isoformat(),
-            }).fetchone()
-
+            """), {"org_id": org_id, "thread_key": thread_key}).mappings().first()
+            
             if not row:
                 return False
+            
+            # If we wrote the row, worker_id should match.
+            return row["worker_id"] == worker_id
 
             locked_by = (row[0] or "")
             # if same worker_id, allow
