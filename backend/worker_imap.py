@@ -116,6 +116,18 @@ def safe_decode(b) -> str:
     except Exception:
         return ""
 
+ALLOWED_STATUSES = {"active", "trialing"}
+
+def org_can_process(org) -> tuple[bool, str]:
+    status = (getattr(org, "subscription_status", "") or "").lower()
+    credits = int(getattr(org, "credits_balance", 0) or 0)
+
+    if status not in ALLOWED_STATUSES:
+        return False, f"blocked: subscription_status={status}"
+    if credits <= 0:
+        return False, f"blocked: credits_balance={credits}"
+    return True, "ok"
+
 
 def norm_mid(mid: str | None) -> str | None:
     if not mid:
