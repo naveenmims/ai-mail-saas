@@ -22,6 +22,17 @@ from app.db import Base
 
 
 class Organization(Base):
+    from sqlalchemy import Column, Integer, Text, Date, DateTime
+    from sqlalchemy.sql import func
+    # (keep your existing imports; only add what’s missing)
+    
+    plan_code = Column(Text, default="free")
+    credits_balance = Column(Integer, nullable=False, default=0)
+    credits_monthly = Column(Integer, nullable=False, default=0)
+    billing_cycle_anchor = Column(Date, nullable=True)
+    credits_reset_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    last_credit_reset_at = Column(DateTime(timezone=True), nullable=True)
+
     __tablename__ = "organizations"
 
     id = Column(Integer, primary_key=True, index=True)

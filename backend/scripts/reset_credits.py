@@ -1,13 +1,12 @@
 import os, sys
 from datetime import datetime, timezone, timedelta
+from sqlalchemy import text
 
-# Ensure /opt/ai-mail/backend is on sys.path so "import app" works
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # .../backend
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from app.db import SessionLocal
-from app.models import Organization
 
 ALLOWED_STATUSES = {"active", "trialing"}
 
@@ -19,27 +18,36 @@ def main():
     now = utcnow()
     changed = 0
 
-    orgs = (
-        db.query(Organization)
-        .filter(Organization.credits_reset_at.isnot(None))
-        .all()
-    )
+    rows = db.execute(text("""
+        SELECT id, subscription_status, credits_monthly, credits_reset_at
+        FROM organizations
+        WHERE credits_reset_at IS NOT NULL
+          AND credits_reset_at <= :now
+    """), {"now": now}).mappings().all()
 
-    for org in orgs:
-        status = (org.subscription_status or "").lower()
+    for r in rows:
+        status = (r.get("subscription_status") or "").lower()
         if status not in ALLOWED_STATUSES:
             continue
 
-        if org.credits_reset_at and org.credits_reset_at <= now:
-            monthly = int(org.credits_monthly or 0)
-            if monthly <= 0:
-                monthly = 100
+        monthly = int(r.get("credits_monthly") or 0)
+        if monthly <= 0:
+            monthly = 100
 
-            org.credits_monthly = monthly
-            org.credits_balance = monthly
-            org.last_credit_reset_at = now
-            org.credits_reset_at = now + timedelta(days=30)
-            changed += 1
+        db.execute(text("""
+            UPDATE organizations
+            SET credits_monthly = :monthly,
+                credits_balance = :monthly,
+                last_credit_reset_at = :now,
+                credits_reset_at = :next_reset
+            WHERE id = :id
+        """), {
+            "id": r["id"],
+            "monthly": monthly,
+            "now": now,
+            "next_reset": now + timedelta(days=30),
+        })
+        changed += 1
 
     if changed:
         db.commit()
