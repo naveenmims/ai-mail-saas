@@ -55,6 +55,47 @@ except Exception:
 
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
+
+def processed_db_seen(org_id: int, message_id: str, days: int = 14) -> bool:
+    """Return True if (org_id,message_id) was seen in last N days."""
+    if not message_id:
+        return False
+    mid = message_id.strip().lower()
+    if mid.startswith("<") and mid.endswith(">"):
+        mid = mid[1:-1].strip()
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(text("""
+                SELECT 1
+                FROM processed_message_ids
+                WHERE org_id = :org_id
+                  AND message_id = :mid
+                  AND created_at >= (now() - (:days || ' days')::interval)
+                LIMIT 1
+            """), {"org_id": int(org_id), "mid": mid, "days": int(days)}).fetchone()
+        return bool(row)
+    except Exception as e:
+        print(f"[DEBUG] processed_db_seen failed: {e!r}")
+        return False
+
+
+def processed_db_add(org_id: int, message_id: str):
+    """Store (org_id,message_id) so we don't reselect it again."""
+    if not message_id:
+        return
+    mid = message_id.strip().lower()
+    if mid.startswith("<") and mid.endswith(">"):
+        mid = mid[1:-1].strip()
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO processed_message_ids (org_id, message_id)
+                VALUES (:org_id, :mid)
+                ON CONFLICT (org_id, message_id) DO NOTHING
+            """), {"org_id": int(org_id), "mid": mid})
+    except Exception as e:
+        print(f"[DEBUG] processed_db_add failed: {e!r}")
+
 # Stable worker id (override via env if you want)
 WORKER_ID = os.getenv("WORKER_ID") or f"{socket.gethostname()}-{os.getpid()}-{str(uuid.uuid4())[:6]}"
 
@@ -109,7 +150,6 @@ def read_text_file(path: str) -> str:
         return ""
     return p.read_text(encoding="utf-8", errors="ignore").strip()
 
-
 def safe_decode(b) -> str:
     try:
         return b.decode(errors="ignore")
@@ -128,7 +168,6 @@ def org_can_process(org) -> tuple[bool, str]:
         return False, f"blocked: credits_balance={credits}"
     return True, "ok"
 
-
 def norm_mid(mid: str | None) -> str | None:
     if not mid:
         return None
@@ -136,7 +175,6 @@ def norm_mid(mid: str | None) -> str | None:
     if mid.startswith("<") and mid.endswith(">"):
         mid = mid[1:-1].strip()
     return mid
-
 
 def extract_email(from_header: str) -> str:
     """
@@ -150,7 +188,6 @@ def extract_email(from_header: str) -> str:
         return m.group(1).strip()
     return from_header.strip().strip('"')
 
-
 def is_ignored_email(text_lower: str) -> bool:
     """
     Pass lowercase text. Returns True if it's marketing/system based on static lists.
@@ -163,6 +200,26 @@ def is_ignored_email(text_lower: str) -> bool:
         return True
     return False
 
+
+def is_bulk_header(hdr_lower: str) -> tuple[bool, str]:
+    """
+    Header-only bulk/list detector (safe for pre-select). Returns (is_bulk, reason).
+    Keep this STRICT. Do not use body text here.
+    """
+    h = (hdr_lower or "").lower()
+    checks = [
+        ("auto-submitted: auto-generated", "auto_generated"),
+        ("auto-submitted: auto-replied", "auto_replied"),
+        ("precedence: bulk", "precedence_bulk"),
+        ("precedence: junk", "precedence_junk"),
+        ("precedence: list", "precedence_list"),
+                ("list-id:", "list_id"),
+        ("feedback-id:", "feedback_id"),
+    ]
+    for needle, reason in checks:
+        if needle in h:
+            return True, reason
+    return False, ""
 
 def is_security_alert_email(subject: str, body: str, raw_headers) -> bool:
     """
@@ -191,7 +248,6 @@ def is_security_alert_email(subject: str, body: str, raw_headers) -> bool:
         or "precedence: junk" in combined
         or "precedence: list" in combined
         or "list-id:" in combined
-        or "list-unsubscribe:" in combined
         or "feedback-id:" in combined
     )
 
@@ -237,7 +293,6 @@ def is_security_alert_email(subject: str, body: str, raw_headers) -> bool:
 
     return False
 
-
 def is_trusted_sender(sender_email: str, org_settings: dict) -> bool:
     """
     Allow bypass of security/system filter for trusted senders.
@@ -271,7 +326,6 @@ def is_trusted_sender(sender_email: str, org_settings: dict) -> bool:
 
     return se in trusted
 
-
 def get_body_text(msg) -> str:
     """
     Prefer plain text. Avoid attachments.
@@ -298,7 +352,6 @@ def get_body_text(msg) -> str:
         pass
 
     return ""
-
 
 # ---------------------- Postgres-backed settings / history ----------------------
 def get_org_settings(org_id: int) -> dict:
@@ -338,7 +391,6 @@ def get_org_settings(org_id: int) -> dict:
         "cooldown_hours": int(getattr(org, "cooldown_hours", 24) or 24),
     }
 
-
 def replies_sent_last_hour(org_id: int) -> int:
     """
     Count replies in last 60 minutes using org_usage table (Postgres).
@@ -361,9 +413,7 @@ def replies_sent_last_hour(org_id: int) -> int:
     except Exception:
         return 0
 
-
 SUBJECT_PREFIX_RE = re.compile(r"^\s*((re|fw|fwd)\s*:\s*)+", re.IGNORECASE)
-
 
 def normalize_subject(s: str) -> str:
     s = (s or "").strip()
@@ -371,12 +421,10 @@ def normalize_subject(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s[:180]
 
-
 def extract_msgids(refs_header: str):
     if not refs_header:
         return []
     return re.findall(r"<[^>]+>", refs_header)
-
 
 def make_thread_key(
     org_id: int,
@@ -395,7 +443,6 @@ def make_thread_key(
     raw = f"{org_id}|{(sender_email or '').strip().lower()}|{ns}"
     h = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
     return f"s:{h}"
-
 
 def replied_to_thread_recently(org_id: int, thread_key: str, hours: int) -> bool:
     """
@@ -422,7 +469,6 @@ def replied_to_thread_recently(org_id: int, thread_key: str, hours: int) -> bool
         return bool(row)
     except Exception:
         return False
-
 
 def replied_to_sender_recently(org_id: int, sender_email: str, hours: int) -> bool:
     """
@@ -451,7 +497,6 @@ def replied_to_sender_recently(org_id: int, sender_email: str, hours: int) -> bo
     except Exception:
         return False
 
-
 def already_replied(org_id: int, message_id: str) -> bool:
     if not message_id:
         return False
@@ -474,7 +519,6 @@ def already_replied(org_id: int, message_id: str) -> bool:
         return bool(row)
     except Exception:
         return False
-
 
 def thread_needs_reply(org_id: int, thread_key: str) -> bool:
     if not thread_key:
@@ -509,14 +553,12 @@ def thread_needs_reply(org_id: int, thread_key: str) -> bool:
     except Exception:
         return True
 
-
 def mark_replied(org_id: int, message_id: str):
     """
     Deprecated in C3: we record replies via conversation_audit OUT rows.
     Kept as no-op for backward compatibility.
     """
     return
-
 
 def mark_seen_by_relogin(a: EmailAccount, imap_host: str, imap_port: int, mid):
     """
@@ -531,7 +573,6 @@ def mark_seen_by_relogin(a: EmailAccount, imap_host: str, imap_port: int, mid):
         im.logout()
     except Exception:
         pass
-
 
 def send_smtp_safe(a: EmailAccount, to_email: str, subject: str, body: str) -> bool:
     if not to_email:
@@ -561,7 +602,6 @@ def send_smtp_safe(a: EmailAccount, to_email: str, subject: str, body: str) -> b
             time.sleep(3)
 
     return False
-
 
 def load_thread_context(org_id: int, thread_key: str, limit: int = 6) -> str:
     """
@@ -621,36 +661,117 @@ def load_thread_context(org_id: int, thread_key: str, limit: int = 6) -> str:
     except Exception:
         return ""
 
-
 # Keep these as no-op to avoid disturbing old flow/call sites.
 def store_conversation(*args, **kwargs):
     return
 
-
 def store_reply_log(*args, **kwargs):
     return
 
+def search_candidate_ids(imap, org_id: int) -> list:
+    """
+    Returns candidate IMAP message sequence IDs to process.
 
-def search_candidate_ids(imap) -> list:
+    Primary: UNSEEN / NEW / RECENT
+    Fallback: SINCE (last 2 days), take last MAX_IDS
+
+    Important: Pre-filter candidates by Message-ID against processed_message_ids,
+               so we don't keep re-selecting already-processed emails.
+    """
     try:
-        st, msg = imap.search(None, "UNSEEN")
-        if st == "OK" and msg and msg[0]:
-            ids = msg[0].split()
-            if ids:
-                return ids
-    except Exception:
-        pass
+        print("[DEBUG] search_candidate_ids: about to imap.search(...)")
 
-    st, msg = imap.search(None, "ALL")
-    if st != "OK" or not msg or not msg[0]:
-        return []
-    return msg[0].split()
+        def _normalize_mid(mid: str) -> str:
+            mid = (mid or "").strip().lower()
+            if mid.startswith("<") and mid.endswith(">"):
+                mid = mid[1:-1].strip()
+            return mid
+
+        def _msgid_for(seq_id: bytes) -> str:
+            # Fetch ONLY Message-ID header (cheap)
+            try:
+                st, data = imap.fetch(seq_id, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+                if st != "OK" or not data:
+                    return ""
+                for item in data:
+                    if isinstance(item, tuple) and item[1]:
+                        txt = item[1].decode(errors="ignore")
+                        m2 = re.search(r"^Message-ID:\s*(.+)\s*$", txt, re.I | re.M)
+                        return _normalize_mid(m2.group(1) if m2 else "")
+            except Exception:
+                return ""
+            return ""
+
+        def _filter_unprocessed(seq_ids: list, limit_keep: int = 10) -> list:
+            # iterate newest->oldest, keep only those NOT in processed DB
+            keep = []
+            for sid in reversed(seq_ids):
+                mid = _msgid_for(sid)
+                try:
+                    dbg_mid = mid
+                    dbg_seen = processed_db_seen(org_id, mid) if mid else None
+                    print('[FILT] sid=%s mid=%s seen=%s' % (sid, dbg_mid, dbg_seen))
+                except Exception as e:
+                    print('[FILT] sid=%s mid=<err> seen=<err> e=%r' % (sid, e))
+                if not mid:
+                    continue
+                # processed_db_seen stores lowercased string; we pass normalized no-brackets ID
+                if processed_db_seen(org_id, mid):
+                    continue
+                keep.append(sid)
+                if len(keep) >= limit_keep:
+                    break
+            return list(reversed(keep))  # oldest->newest
+
+        # 1) Primary: UNSEEN / NEW / RECENT
+        for q in ("UNSEEN", "NEW", "RECENT"):
+            try:
+                st, msg = imap.search(None, q)
+                ids = msg[0].split() if (st == "OK" and msg and msg[0]) else []
+                print(f"[DEBUG] imap.search {q} status={st} raw_len={len(msg[0]) if (msg and msg[0]) else 0} count={len(ids)}")
+                if ids:
+                    filtered = _filter_unprocessed(ids, limit_keep=10)
+                    if filtered:
+                        return filtered
+            except Exception as e:
+                print(f"[DEBUG] imap.search {q} failed: {e!r}")
+
+        # 2) Fallback: SINCE last 2 days
+        from datetime import datetime, timedelta
+        since_dt = datetime.utcnow() - timedelta(days=2)
+        since_str = since_dt.strftime("%d-%b-%Y")  # IMAP date format
+
+        try:
+            st2, msg2 = imap.search(None, "SINCE", since_str)
+            ids2 = msg2[0].split() if (st2 == "OK" and msg2 and msg2[0]) else []
+            print(f"[DEBUG] imap.search SINCE {since_str} status={st2} raw_len={len(msg2[0]) if (msg2 and msg2[0]) else 0} count={len(ids2)}")
+
+            MAX_IDS = 50
+            tail = ids2[-MAX_IDS:]
+            filtered = _filter_unprocessed(tail, limit_keep=10)
+            try:
+                dropped = [x for x in tail if x not in filtered]
+                if dropped:
+                    print('[CANDS_DROP] dropped=%s' % (dropped[-20:],))
+            except Exception:
+                pass
+            try:
+                print('[CANDS] since_raw=%s tail=%s after_filter=%s keep_last10=%s' % (len(ids2), len(tail), len(filtered), filtered[-10:]))
+            except Exception:
+                pass
+            return filtered
+        except Exception as e:
+            print(f"[DEBUG] imap.search SINCE failed: {e!r}")
+
+    except Exception as e:
+        print(f"[DEBUG] search_candidate_ids exception: {e!r}")
+
+    return []
 
 
 # ---------- main ----------
 replied_mids_this_run = set()
 replied_threads_this_run = set()
-
 
 def is_real_enquiry(
     subject: str,
@@ -672,7 +793,7 @@ def is_real_enquiry(
 
     # Bulk signals: check ONLY subject+from+headers (NOT body)
     bulk_signals = [
-        "list-unsubscribe", "list-id", "list-help", "list-post",
+        "list-id", "list-help", "list-post",
         "unsubscribe", "manage preferences", "view in browser",
         "you are receiving this email because", "email preferences",
         "newsletter", "promotion", "campaign", "marketing",
@@ -730,7 +851,6 @@ def is_real_enquiry(
             return True
 
     return False
-
 
 def build_prompt(org_settings: dict, subject: str, sender: str, body: str, thread_context: str) -> tuple[str, str]:
     kb_text = (org_settings.get("kb_text") or "").strip()
@@ -793,12 +913,7 @@ ORG KNOWLEDGE BASE (KB):
 """
     return system_prompt, user_prompt
 
-
 def main():
-    print("IMAP Worker started...\n")
-    logger.info("event=test_log_created org=system credits=0")
-    logger.info(f"event=worker_start worker_id={WORKER_ID}")
-
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
@@ -878,14 +993,27 @@ def main():
                 imap.login(a.imap_username, a.imap_password)
                 imap.select(INBOX_FOLDER)
 
-                ids = search_candidate_ids(imap)
-                if not ids:
+                candidate_ids = []
+
+                candidate_ids = search_candidate_ids(imap, org_id)
+                # DEBUG: dump unseen ids
+                try:
+                    st_dbg, msg_dbg = imap.search(None, 'UNSEEN')
+                    ids_dbg = msg_dbg[0].split() if (st_dbg=='OK' and msg_dbg and msg_dbg[0]) else []
+                    print(f"[DEBUG] worker-session UNSEEN ids={len(ids_dbg)} last5={ids_dbg[-5:]}")
+                except Exception as e:
+                    print(f"[DEBUG] worker-session UNSEEN probe failed: {e}")
+                if not candidate_ids:
                     imap.logout()
-                    print("No emails found.\n")
+                    print("No candidate emails found (UNSEEN/NEW/RECENT empty; SINCE fallback may also be empty).\n")
                     break
 
+                chosen_mid = None
                 # choose a non-marketing email based on headers
-                for mid in reversed(ids[-SCAN_LAST_N:]):
+                scanned_n = 0
+                bulk_skipped_n = 0
+                bulk_reason_counts = {}
+                for mid in reversed(candidate_ids[-SCAN_LAST_N:]):
                     st, hdrdata = imap.fetch(
                         mid,
                         "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID REFERENCES IN-REPLY-TO LIST-UNSUBSCRIBE LIST-ID)])",
@@ -893,15 +1021,33 @@ def main():
                     if not hdrdata or not isinstance(hdrdata[0], tuple):
                         continue
                     hdr = safe_decode(hdrdata[0][1]) or ""
-                    if is_ignored_email(hdr.lower()):
+                    hdr_l = hdr.lower()
+                    scanned_n += 1
+                    is_bulk, bulk_reason = is_bulk_header(hdr_l)
+                    if is_bulk:
+                        bulk_skipped_n += 1
+                        bulk_reason_counts[bulk_reason] = bulk_reason_counts.get(bulk_reason, 0) + 1
+                        if DEBUG:
+                            print(f"[DEBUG] header-skip mid={mid} reason={bulk_reason}")
                         continue
                     chosen_mid = mid
                     chosen_hdr = hdr
                     break
 
                 if chosen_mid is None:
-                    imap.logout()
                     print("No suitable (non-marketing/system) emails found.\n")
+                    # Header scan summary
+                    try:
+                        top = sorted(bulk_reason_counts.items(), key=lambda kv: kv[1], reverse=True)[:3]
+                        top_s = ', '.join(['%s=%s' % (kk, vv) for kk, vv in top]) if top else ''
+                        print('[HDRSCAN] scanned=%s bulk_skipped=%s top=%s' % (scanned_n, bulk_skipped_n, top_s))
+                    except Exception:
+                        pass
+                    # Do NOT mark messages as Seen here; it can hide real enquiries.
+                    try:
+                        imap.logout()
+                    except Exception:
+                        pass
                     break
 
                 st, data = imap.fetch(chosen_mid, "(BODY.PEEK[])")
@@ -930,9 +1076,14 @@ def main():
                 print("Subject:", subject)
                 print("From:", sender)
                 print("Message-ID:", message_id)
+                # Skip if already processed recently (prevents reselect loop)
+                if processed_db_seen(org_id, message_id):
+                    print("Already processed (DB). Skipping.")
+                    continue
                 print("Thread-Key:", thread_key)
 
                 logger.info(f"event=email_selected org={org_slug} message_id={message_id_n} thread_key={thread_key}")
+                # Mark as processed as soon as selected (prevents reselection loops)
 
                 hdr_combo = f"{subject}\n{sender}\n{message_id}".lower()
                 if is_ignored_email(hdr_combo):
@@ -943,6 +1094,7 @@ def main():
                 # Per-message-id de-dupe (DB) early
                 if message_id_n and already_replied(org_id, message_id_n):
                     print("Already replied to this Message-ID. Skipping send.\n")
+                    processed_db_add(org_id, message_id)
                     try:
                         imap.store(chosen_mid, "+FLAGS", "\\Seen")
                     except Exception:
@@ -1025,6 +1177,7 @@ def main():
                         f"event=not_real_enquiry org={org_slug} reason={reason} from={sender_email} thread_key={thread_key} subject={subject[:120]!r}"
                     )
                     print("Not a real enquiry (likely marketing/system). Skipping.\n")
+                    processed_db_add(org_id, message_id)
                     try:
                         imap.store(chosen_mid, "+FLAGS", "\\Seen")
                     except Exception:
@@ -1038,7 +1191,7 @@ def main():
                 # Enterprise lock (Postgres: app.services.thread_lock)
                 from app.services.thread_lock import try_acquire_thread_lock
 
-                THREAD_LOCK_SECONDS = 600
+                THREAD_LOCK_SECONDS = int(os.getenv("THREAD_LOCK_SECONDS", "120"))
                 got_lock = try_acquire_thread_lock(
                     engine,
                     org_id=org_id,
@@ -1049,6 +1202,7 @@ def main():
                 )
                 if not got_lock:
                     print(f"[LOCK] Skip duplicate reply (another worker owns lock) org={org_id} thread={thread_key}\n")
+                    processed_db_add(org_id, message_id)
                     logger.info(f"event=lock_skip org={org_slug} thread_key={thread_key}")
                     try:
                         imap.store(chosen_mid, "+FLAGS", "\\Seen")
@@ -1130,6 +1284,7 @@ def main():
                 # Only reply if new IN > OUT
                 if not thread_needs_reply(org_id, thread_key):
                     print("[SKIP] No new customer message in thread. Already replied.\n")
+                    processed_db_add(org_id, message_id)
                     try:
                         imap.store(chosen_mid, "+FLAGS", "\\Seen")
                     except Exception:
@@ -1354,7 +1509,6 @@ def main():
 
                 break
 
-
 if __name__ == "__main__":
     import time as _time
     import logging as _logging
@@ -1362,7 +1516,9 @@ if __name__ == "__main__":
     _logging.basicConfig(level=_logging.INFO)
     _logger = _logging.getLogger("aimail-worker")
 
-    _logger.info("IMAP Worker started (continuous mode)...")
+    print("IMAP Worker started...\n")
+    _logger.info("event=test_log_created org=system credits=0")
+    _logger.info(f"event=worker_start worker_id={WORKER_ID}")
 
     while True:
         try:
