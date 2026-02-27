@@ -34,12 +34,6 @@ def login(payload: LoginIn, db: Session = Depends(get_db)):
             detail="Invalid credentials",
         )
 
-    if not user.is_email_verified:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Email not verified",
-        )
-
     # IMPORTANT: models.py exposes DB column "password" as user.password_hash
     if not verify_password(payload.password, user.password_hash):
         raise HTTPException(
