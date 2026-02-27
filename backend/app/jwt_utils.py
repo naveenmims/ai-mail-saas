@@ -1,23 +1,38 @@
-import time
-import jwt
+import os
+from datetime import datetime, timedelta, timezone
+from jose import jwt, JWTError
 
-# DEV ONLY secret (we will move to env later)
-JWT_SECRET = "dev-secret-change-me"
-JWT_ALG = "HS256"
-JWT_EXP_SECONDS = 60 * 60 * 24  # 24 hours
+JWT_ALG = os.getenv("JWT_ALG", "HS256")
 
+def _secret() -> str:
+    s = os.getenv("JWT_SECRET", "")
+    if not s:
+        raise RuntimeError("JWT_SECRET not configured")
+    return s
 
 def create_access_token(user_id: int, org_id: int, role: str) -> str:
-    now = int(time.time())
+    """
+    Backwards-compatible signature used by app/main.py and backups.
+    Uses the SAME env JWT_SECRET as app/core/auth.py, and jose encoding.
+    """
+    now = datetime.now(timezone.utc)
+    exp_minutes = int(os.getenv("JWT_EXPIRES_MINUTES", "120"))
+    exp = now + timedelta(minutes=exp_minutes)
+
     payload = {
         "sub": str(user_id),
-        "org_id": org_id,
+        "org_id": int(org_id) if org_id is not None else None,
         "role": role,
-        "iat": now,
-        "exp": now + JWT_EXP_SECONDS,
+        "iat": int(now.timestamp()),
+        "exp": int(exp.timestamp()),
     }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
-
+    return jwt.encode(payload, _secret(), algorithm=JWT_ALG)
 
 def verify_token(token: str) -> dict:
-    return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    """
+    Backwards-compatible: returns decoded payload dict or raises.
+    """
+    try:
+        return jwt.decode(token, _secret(), algorithms=[JWT_ALG])
+    except JWTError as e:
+        raise ValueError("Invalid token") from e
