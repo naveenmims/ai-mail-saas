@@ -1,3 +1,4 @@
+from app.api.routes import me
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -183,6 +184,7 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None, 
 
     return {"ok": True}
 
+app.include_router(me.router)
 app.include_router(admin_router)
 app.include_router(admin_c3_router)
 app.include_router(billing_router)          # Stripe
