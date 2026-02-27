@@ -1,7 +1,8 @@
 from app.api.routes import me
 from pathlib import Path
 from dotenv import load_dotenv
-
+from app.api.routes.whoami import router as whoami_router
+from fastapi.responses import RedirectResponse
 BASE_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(BASE_DIR / ".env")
 
@@ -32,7 +33,6 @@ from app.routers.admin_c3 import router as admin_c3_router
 
 from app.routers.billing import router as billing_router   # keep as it is ✅
 from app.routers.billing_manual import router as manual_billing_router  # add ✅
-from pathlib import Path
 from app.admin_analytics import router as admin_analytics_router
 
 
@@ -48,25 +48,9 @@ def load_env_file():
 
 load_env_file()
 
-
-def load_env_file():
-    env_path = Path(__file__).resolve().parents[1] / ".env"  # backend/.env
-    if env_path.exists():
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
-
-load_env_file()
-
-
-
 # ✅ Create app FIRST
 app = FastAPI(title="AI Mail SaaS")
 
-from fastapi.responses import RedirectResponse
 
 @app.get("/", include_in_schema=False)
 def root():
@@ -74,7 +58,7 @@ def root():
 
 templates = Jinja2Templates(directory="app/templates")
 
-from fastapi.openapi.utils import get_openapi
+
 
 def custom_openapi():
     # Build the default schema first
@@ -186,13 +170,11 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None, 
 
 app.include_router(me.router)
 app.include_router(whoami_router)
-app.include_router(admin_router)
 app.include_router(admin_c3_router)
 app.include_router(billing_router)          # Stripe
 app.include_router(manual_billing_router)   # Manual
 app.include_router(admin_analytics_router)
 from app.api.routes.worker_health import router as worker_health_router
-from app.api.routes.whoami import router as whoami_router
 app.include_router(worker_health_router)
 
 
@@ -214,7 +196,6 @@ application = app
 bearer_scheme = HTTPBearer()
 
 # ✅ Admin API routes (used by /static/admin.html)
-app.include_router(admin_router)
 
 @app.get("/debug/env")
 def debug_env():
