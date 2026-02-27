@@ -185,12 +185,14 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None, 
     return {"ok": True}
 
 app.include_router(me.router)
+app.include_router(whoami_router)
 app.include_router(admin_router)
 app.include_router(admin_c3_router)
 app.include_router(billing_router)          # Stripe
 app.include_router(manual_billing_router)   # Manual
 app.include_router(admin_analytics_router)
 from app.api.routes.worker_health import router as worker_health_router
+from app.api.routes.whoami import router as whoami_router
 app.include_router(worker_health_router)
 
 
