@@ -96,8 +96,33 @@ def processed_db_add(org_id: int, message_id: str):
     except Exception as e:
         print(f"[DEBUG] processed_db_add failed: {e!r}")
 
+def draft_db_add_engine(engine, org_id: int, message_id: str, from_email: str, to_email: str, subject: str, body: str, draft_text: str):
+    """
+    Save a reply draft (idempotent by org_id+message_id).
+    """
+    try:
+        q = text("""
+            INSERT INTO reply_drafts (org_id, message_id, from_email, to_email, subject, body, draft_text, status)
+            VALUES (:org_id,:message_id,:from_email,:to_email,:subject,:body,:draft_text,'draft')
+            ON CONFLICT (org_id, message_id) DO NOTHING
+        """)
+        with engine.begin() as conn:
+            conn.execute(q, {
+                "org_id": org_id,
+                "message_id": message_id,
+                "from_email": (from_email or ""),
+                "to_email": (to_email or ""),
+                "subject": (subject or ""),
+                "body": (body or ""),
+                "draft_text": (draft_text or ""),
+            })
+    except Exception as e:
+        print(f"[WARN] failed to save draft: {e}")
+
 # Stable worker id (override via env if you want)
 WORKER_ID = os.getenv("WORKER_ID") or f"{socket.gethostname()}-{os.getpid()}-{str(uuid.uuid4())[:6]}"
+AIMAIL_DRAFT_ONLY = os.getenv('AIMAIL_DRAFT_ONLY', '1').strip()  # 1=draft-only, 0=send
+
 
 INBOX_FOLDER = "INBOX"
 SCAN_LAST_N = 30  # scan last N emails for a non-marketing one (reduce load)
@@ -1374,8 +1399,18 @@ def main():
                     print(reply[:800])
 
                     to_email = sender_email
-                    smtp_ok = send_smtp_safe(a, to_email, "Re: " + subject, reply)
 
+                    draft_only = (AIMAIL_DRAFT_ONLY != '0')
+
+                    if draft_only:
+
+                        draft_db_add_engine(engine, org_id, message_id, sender_email, to_email, subject, body, reply)
+
+                        smtp_ok = True
+
+                    else:
+
+                        smtp_ok = send_smtp_safe(a, to_email, "Re: " + subject, reply)
                 except Exception as e:
                     print("WORKER ERROR (OpenAI/SMTP block):", repr(e))
                     logger.exception(f"event=worker_error org={org_slug} kind=openai_or_smtp")
