@@ -473,7 +473,20 @@ class ReplyRequest(BaseModel):
 
 @app.post("/ai/reply")
 def ai_reply(payload: ReplyRequest, current_user: User = Depends(get_current_user)):
-    reply_text = generate_reply(payload.subject, payload.body)
+    try:
+        reply_text = generate_reply(
+            payload.subject,
+            payload.body,
+            current_user.org_id,
+            from_name="Book URL"
+        )
+    except Exception:
+        reply_text = f"""Subject received: {payload.subject}
+
+Thank you for your email. We have received your message and will respond shortly.
+
+Regards,
+Book URL"""
     return {"reply": reply_text}
 @app.get("/healthz")
 def healthz():
