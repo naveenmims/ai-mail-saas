@@ -36,3 +36,6 @@ venv/
 # Editor/backup files
 *.bak*
 *.save
+
+# accidental Windows-path artifacts
+:USERPROFILE*
