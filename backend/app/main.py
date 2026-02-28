@@ -2,6 +2,7 @@ from app.api.routes import me
 from pathlib import Path
 from dotenv import load_dotenv
 from app.api.routes.whoami import router as whoami_router
+import re
 from fastapi.responses import RedirectResponse
 BASE_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(BASE_DIR / ".env")
@@ -487,12 +488,25 @@ Thank you for your email. We have received your message and will respond shortly
 
 Regards,
 Book URL"""
+    reply_text = _email_sanitize_text(reply_text)
     return {"reply": reply_text}
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
 from app.db import engine
 
+
+def _email_sanitize_text(text: str) -> str:
+    # Make output safe for plain-text email clients (remove basic markdown)
+    if not text:
+        return ""
+    # remove bold markers
+    text = text.replace("**", "")
+    # convert headings like "### Title" -> "Title"
+    text = re.sub(r"^\s*#{1,6}\s+", "", text, flags=re.M)
+    # normalize multiple blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 @app.get("/readyz")
 def readyz():
     try:
