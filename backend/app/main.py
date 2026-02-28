@@ -490,6 +490,27 @@ Regards,
 Book URL"""
     reply_text = _email_sanitize_text(reply_text)
     return {"reply": reply_text}
+
+from fastapi import Query
+from sqlalchemy import text
+
+@app.get("/drafts")
+def list_drafts(
+    limit: int = Query(50, ge=1, le=200),
+    current_user: User = Depends(get_current_user)
+):
+    # Uses raw SQL to avoid adding new ORM models right now
+    q = text("""
+        SELECT id, org_id, message_id, from_email, to_email, subject, status, created_at
+        FROM reply_drafts
+        WHERE org_id = :org_id
+        ORDER BY created_at DESC
+        LIMIT :limit
+    """)
+    with engine.begin() as conn:
+        rows = conn.execute(q, {"org_id": current_user.org_id, "limit": limit}).mappings().all()
+    return {"items": list(rows)}
+
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
